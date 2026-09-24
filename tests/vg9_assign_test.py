@@ -203,14 +203,26 @@ check("不存在的国家 -> 空方案 + 给出可选国家",
 
 # ============ [9] mode=same：默认排除的国家被显式点名 ============
 log("\n[9] mode=same：显式点名默认排除的国家（China）")
-r9 = M.build_assign_plan(fresh_channels(), "same", "", "China")
-p9 = r9["plan"]
-check("China 被显式指定时仍可用", bool(p9), str(r9["warnings"]))
-check("方案里的国家就是 China", p9 and {p["country"] for p in p9} == {"China"})
-check("给出\"在默认排除名单里\"的说明",
-      any("排除名单" in w for w in r9["warnings"]), str(r9["warnings"]))
-check("不再重复报\"已跳过 N 个 china 节点\"",
-      not any("已跳过" in w for w in r9["warnings"]), str(r9["warnings"]))
+# China 节点在 VPNGate 上是间歇在线的：直接依赖真实池会让这一段随缘失败
+# （曾出现"线上没有 China 节点"导致 3 项误报）。这里临时注入几个再测。
+_injected = [{"id": f"cn-test-{i}", "ip": f"203.0.113.{i + 1}", "port": "443",
+              "country_long": "China", "country": "China", "ping": 10, "speed": 1000000,
+              "config_text": "client\ndev tun\n", "hostname": f"cn-test-{i}",
+              "ip_type": "residential", "ip_reason": "测试注入"} for i in range(3)]
+_pool_backup = list(M.nodes_cache)
+M.nodes_cache = list(M.nodes_cache) + _injected
+try:
+    r9 = M.build_assign_plan(fresh_channels(), "same", "", "China")
+    p9 = r9["plan"]
+    check("China 被显式指定时仍可用", bool(p9), str(r9["warnings"]))
+    check("方案里的国家就是 China", bool(p9) and {p["country"] for p in p9} == {"China"},
+          str(sorted({p["country"] for p in p9})) if p9 else str(r9["warnings"]))
+    check("给出\"在默认排除名单里\"的说明",
+          any("排除名单" in w for w in r9["warnings"]), str(r9["warnings"]))
+    check("不再重复报\"已跳过 N 个 china 节点\"",
+          not any("已跳过" in w for w in r9["warnings"]), str(r9["warnings"]))
+finally:
+    M.nodes_cache = _pool_backup
 
 # ============ [10] mode=same：该国节点不够 ============
 log("\n[10] mode=same：该国节点不够 9 条时")
