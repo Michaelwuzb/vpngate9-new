@@ -12,6 +12,7 @@ if [ "$(id -u)" != "0" ]; then echo -e "${RED}必须以 root 权限运行${NC}";
 
 INSTALL_DIR="/opt/michaelvpn"
 SERVICE_NAME="michaelvpn"
+GUARD_SERVICE="vpngate9-guard"
 # 默认装 vpngate9-new（完整版：源码 + tests/ + docs/）。
 # 想装别的分支/仓库: bash install.sh <owner> <repo>
 REPO_OWNER="${1:-Michaelwuzb}"
@@ -34,13 +35,17 @@ if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "卸载" ]; then
     echo -e "${YELLOW}正在卸载 MichaelVPN...${NC}"
     systemctl stop ${SERVICE_NAME} 2>/dev/null || true
     systemctl disable ${SERVICE_NAME} 2>/dev/null || true
+    # 守护也装了服务，得一起停掉 —— 否则它会继续按老端口探活、给已删掉的通道重连
+    systemctl stop ${GUARD_SERVICE} 2>/dev/null || true
+    systemctl disable ${GUARD_SERVICE} 2>/dev/null || true
     rm -f /lib/systemd/system/${SERVICE_NAME}.service
+    rm -f /lib/systemd/system/${GUARD_SERVICE}.service
     systemctl daemon-reload
     cleanup_policy_routing
     rm -rf "$INSTALL_DIR"
     rm -f /usr/bin/ml
     rm -f /etc/sysctl.d/99-${SERVICE_NAME}.conf
-    pkill -f "vpngate9_multi\|proxy_server_multi" 2>/dev/null || true
+    pkill -f "vpngate9_multi\|proxy_server_multi\|vpngate9_guard" 2>/dev/null || true
     echo -e "${GREEN}卸载完成！${NC}"
     exit 0
 fi
@@ -60,19 +65,21 @@ detect_distro() {
 }
 
 install_deps() {
-    echo -e "${CYAN}[1/4] 安装依赖...${NC}"
+    echo -e "${CYAN}[1/5] 安装依赖...${NC}"
+    # openssl 是为了给面板自签 HTTPS 证书（找不到现成证书时的兜底）。
+    # 系统自带的一般都有，这里显式装上，省得落到"没 openssl 就退明文 HTTP"。
     case "$PKG_MANAGER" in
-        apt-get) apt-get update -qq && apt-get install -y -qq openvpn curl git ca-certificates iptables iproute2 psmisc python3 2>/dev/null ;;
-        apk) apk update -q && apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash 2>/dev/null ;;
-        dnf|yum) $PKG_MANAGER install -y epel-release 2>/dev/null || true; $PKG_MANAGER install -y openvpn curl git ca-certificates iptables iproute psmisc python3 2>/dev/null ;;
-        pacman) pacman -S --noconfirm openvpn curl git ca-certificates iptables iproute2 psmisc python 2>/dev/null ;;
-        zypper) zypper install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 2>/dev/null ;;
+        apt-get) apt-get update -qq && apt-get install -y -qq openvpn curl git ca-certificates iptables iproute2 psmisc python3 openssl 2>/dev/null ;;
+        apk) apk update -q && apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash openssl 2>/dev/null ;;
+        dnf|yum) $PKG_MANAGER install -y epel-release 2>/dev/null || true; $PKG_MANAGER install -y openvpn curl git ca-certificates iptables iproute psmisc python3 openssl 2>/dev/null ;;
+        pacman) pacman -S --noconfirm openvpn curl git ca-certificates iptables iproute2 psmisc python openssl 2>/dev/null ;;
+        zypper) zypper install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 openssl 2>/dev/null ;;
     esac
     echo -e "${GREEN}  OK${NC}"
 }
 
 deploy_code() {
-    echo -e "${CYAN}[2/4] 部署代码...${NC}"
+    echo -e "${CYAN}[2/5] 部署代码...${NC}"
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR" && git fetch --all 2>/dev/null || true && git reset --hard origin/$BRANCH 2>/dev/null || true
     else
@@ -151,7 +158,7 @@ PYEOF
 }
 
 install_service() {
-    echo -e "${CYAN}[3/4] 配置服务...${NC}"
+    echo -e "${CYAN}[3/5] 配置面板服务...${NC}"
     cat > /lib/systemd/system/${SERVICE_NAME}.service << 'SERVICEEOF'
 [Unit]
 Description=MichaelVPN 9-Channel VPN Gateway
@@ -177,19 +184,63 @@ SERVICEEOF
     echo -e "${GREEN}  OK${NC}"
 }
 
+# 通道守护：判断"假连接"（面板显示已连接但 SOCKS5 实测没有出口流量）并自动换节点。
+# 以前要照着 README 手动写这一份 service，装完忘了装就等于没有守护 ——
+# 所以这里直接一起装上。不想装：ML_NO_GUARD=1 bash install.sh
+install_guard_service() {
+    if [ "${ML_NO_GUARD:-0}" = "1" ]; then
+        echo -e "${YELLOW}[4/5] 跳过守护服务（ML_NO_GUARD=1）${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}[4/5] 配置守护服务...${NC}"
+    cat > /lib/systemd/system/${GUARD_SERVICE}.service << 'GUARDEOF'
+[Unit]
+Description=MichaelVPN Channel Guard (fake-connection detector)
+# 面板是它探活的对象，排在面板后面启动才有意义
+After=network.target network-online.target michaelvpn.service
+Wants=network-online.target
+# 崩了要能一直重来（默认 5 次/10 秒 会被 systemd 放弃，守护就没了）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/michaelvpn
+ExecStart=/usr/bin/python3 /opt/michaelvpn/vpngate9_guard.py
+Restart=always
+RestartSec=10
+# 守护会调 curl 走 SOCKS5 实测出口，同时最多 9 条
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+GUARDEOF
+    systemctl daemon-reload
+    systemctl enable ${GUARD_SERVICE} 2>/dev/null || true
+    echo -e "${GREEN}  OK${NC}"
+}
+
 install_ml() {
-    echo -e "${CYAN}[4/4] 创建 ml 命令...${NC}"
+    echo -e "${CYAN}[5/5] 创建 ml 命令...${NC}"
     cat > /usr/bin/ml << 'MLEOF'
 #!/bin/bash
+# 面板接口调用：面板可能跑在 https 上（复用 s-ui 等现成证书，或自签）。
+# 走回环地址，所以用 -k 跳过证书校验 —— 自签证书的域名本来就对不上 127.0.0.1。
+panel_api() {
+    curl -sk --max-time 8 "https://localhost:8787$1" 2>/dev/null && return 0
+    curl -s --max-time 8 "http://localhost:8787$1" 2>/dev/null
+}
 case "${1:-status}" in
-    start)   systemctl start michaelvpn 2>/dev/null ;;
-    stop)    systemctl stop michaelvpn 2>/dev/null ;;
-    restart) systemctl restart michaelvpn 2>/dev/null ;;
+    start)   systemctl start michaelvpn vpngate9-guard 2>/dev/null ;;
+    stop)    systemctl stop michaelvpn vpngate9-guard 2>/dev/null ;;
+    restart) systemctl restart michaelvpn 2>/dev/null; systemctl restart vpngate9-guard 2>/dev/null ;;
     uninstall|卸载)
         echo -e "\033[0;33m正在卸载 MichaelVPN...\033[0m"
         systemctl stop michaelvpn 2>/dev/null || true
         systemctl disable michaelvpn 2>/dev/null || true
+        systemctl stop vpngate9-guard 2>/dev/null || true
+        systemctl disable vpngate9-guard 2>/dev/null || true
         rm -f /lib/systemd/system/michaelvpn.service
+        rm -f /lib/systemd/system/vpngate9-guard.service
         systemctl daemon-reload
         # 清掉 9 条通道写的策略路由（tun 没了但 ip rule 还在，会劫持其它程序的流量）
         for t in $(seq 200 208); do
@@ -199,18 +250,22 @@ case "${1:-status}" in
         rm -rf /opt/michaelvpn
         rm -f /usr/bin/ml
         rm -f /etc/sysctl.d/99-michaelvpn.conf
-        pkill -f "vpngate9_multi\|proxy_server_multi" 2>/dev/null || true
+        pkill -f "vpngate9_multi\|proxy_server_multi\|vpngate9_guard" 2>/dev/null || true
         echo -e "\033[0;32m卸载完成！\033[0m" ;;
     status)
         echo "=== MichaelVPN 9-Channel ==="
-        curl -s http://localhost:8787/api/status | python3 -c "
+        panel_api /api/status | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
+print('面板: %s  %s' % (d.get('ui_scheme','http').upper(),
+                       d.get('ui_tls_source','') or '-'))
 for c in d['channels']:
     s=c['state']; co=c.get('node_country') or '-'; ip=c.get('node_ip') or '-'
     print(f'CH{c[\"index\"]}: {s:15s} {co:20s} IP={ip:16s} :{c[\"proxy_port\"]}')
 print(f'--- {d[\"node_count\"]} nodes ---')" 2>/dev/null || systemctl status michaelvpn --no-pager ;;
+    guard)   systemctl status vpngate9-guard --no-pager ;;
     logs)    journalctl -u michaelvpn --no-pager -n 50 -f ;;
+    guardlogs) journalctl -u vpngate9-guard --no-pager -n 50 -f ;;
     passwd|改密)
         shift
         if [ $# -eq 0 ]; then
@@ -220,8 +275,9 @@ print(f'--- {d[\"node_count\"]} nodes ---')" 2>/dev/null || systemctl status mic
             exit 1
         fi
         python3 /opt/michaelvpn/vpngate9_multi.py --set-credentials "$@" || exit 1
-        systemctl restart michaelvpn 2>/dev/null ;;
-    *)       echo "用法: ml {start|stop|restart|status|logs|passwd|uninstall}" ;;
+        systemctl restart michaelvpn 2>/dev/null
+        systemctl restart vpngate9-guard 2>/dev/null ;;
+    *)       echo "用法: ml {start|stop|restart|status|guard|logs|guardlogs|passwd|uninstall}" ;;
 esac
 MLEOF
     chmod +x /usr/bin/ml
@@ -245,6 +301,7 @@ detect_distro
 install_deps
 deploy_code
 install_service
+install_guard_service
 install_ml
 configure_network
 
@@ -252,10 +309,24 @@ echo ""
 echo -e "${GREEN}部署完成！启动服务...${NC}"
 systemctl start ${SERVICE_NAME} 2>/dev/null || true
 sleep 3
-systemctl is-active ${SERVICE_NAME} &>/dev/null && echo -e "${GREEN}服务运行中${NC}" || echo -e "${YELLOW}检查: systemctl status michaelvpn${NC}"
+systemctl is-active ${SERVICE_NAME} &>/dev/null && echo -e "${GREEN}面板运行中${NC}" || echo -e "${YELLOW}检查: systemctl status michaelvpn${NC}"
+[ "${ML_NO_GUARD:-0}" = "1" ] || systemctl start ${GUARD_SERVICE} 2>/dev/null || true
 PUBLIC_IP=$(curl -s --connect-timeout 5 api64.ipify.org 2>/dev/null || curl -s --connect-timeout 5 api.ipify.org 2>/dev/null || echo "<VPS_IP>")
+
+# 面板是 http 还是 https，直接问面板自己（它按机器上有没有现成证书决定），
+# 不要在这里猜 —— 猜错了用户点开就是打不开。
+PROBE=$(curl -sk --max-time 8 https://127.0.0.1:8787/api/status 2>/dev/null)
+[ -z "$PROBE" ] && PROBE=$(curl -s --max-time 8 http://127.0.0.1:8787/api/status 2>/dev/null)
+SCHEME=$(printf '%s' "$PROBE" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ui_scheme','http'))" 2>/dev/null || echo http)
+CERT_DESC=$(printf '%s' "$PROBE" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ui_tls_source',''))" 2>/dev/null || echo "")
+
 echo ""
-echo -e "  Web UI:    ${CYAN}http://${PUBLIC_IP}:8787/${NC}"
+echo -e "  Web UI:    ${CYAN}${SCHEME}://${PUBLIC_IP}:8787/${NC}"
+if [ "$SCHEME" = "https" ]; then
+    echo -e "  面板证书:  ${CYAN}${CERT_DESC:-未知}${NC}"
+    echo -e "             ${YELLOW}自签证书浏览器会提示不安全，点\"继续访问\"即可；${NC}"
+    echo -e "             ${YELLOW}想换成受信任的证书：把它放到 /usr/local/s-ui/cert/ 后重启面板${NC}"
+fi
 echo -e "  默认账号:  ${CYAN}admin${NC}"
 echo -e "  默认密码:  ${CYAN}admin${NC}"
 echo -e "  ${YELLOW}请登录后点右上角\"管理员\"立即修改账号和密码${NC} (改完需重新登录)"
@@ -264,4 +335,11 @@ echo -e "  代理端口:  ${CYAN}47928~47936${NC} (tun0~tun8)"
 echo -e "  策略路由:  ${CYAN}table 200~208${NC} (卸载时自动清理)"
 echo -e "  状态:      ${CYAN}ml status${NC}"
 echo -e "  日志:      ${CYAN}ml logs${NC}"
+if [ "${ML_NO_GUARD:-0}" = "1" ]; then
+    echo -e "  守护:      ${YELLOW}未安装 (ML_NO_GUARD=1)${NC}"
+else
+    systemctl is-active ${GUARD_SERVICE} &>/dev/null \
+        && echo -e "  守护:      ${GREEN}已运行${NC} (假连接自动换节点)" \
+        || echo -e "  守护:      ${YELLOW}已安装但未运行, 查: ml guard${NC}"
+fi
 echo -e "  卸载:      ${CYAN}ml uninstall${NC}"

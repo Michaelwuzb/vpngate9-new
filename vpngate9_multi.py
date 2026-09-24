@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 import vpn_utils
 import speedtest_utils
+import ui_tls
 
 # === Auth ===
 # 密码以 PBKDF2-SHA256 哈希存储(兼容旧版明文自动升级)；
@@ -183,6 +184,15 @@ POLICY_TABLE_BASE = int(os.environ.get("VPNGATE_POLICY_TABLE_BASE", "200"))
 UI_PORT = 8787
 UI_HOST = "::"
 LOCAL_PROXY_HOST = "127.0.0.1"
+# 节点 IP 类型的合法取值。unknown = 机构名和 PTR 都判不出类型（见 vpn_utils.py），
+# 它只是"没判出来"，不影响节点可用性，也不影响不指定类型时的自动分配。
+IP_TYPE_KEYS = ("residential", "mobile", "hosting", "unknown")
+# 给用户看的名字。日志/提示里别直接甩 'unknown' 这种内部值。
+IP_TYPE_LABELS = {"residential": "住宅", "mobile": "移动", "hosting": "机房", "unknown": "未知"}
+
+
+def ip_type_label(t: str) -> str:
+    return IP_TYPE_LABELS.get(t or "", t or "")
 API_URL = "https://www.vpngate.net/api/iphone/"
 # 多级节点源，按顺序尝试。9 条通道共用同一个节点池：只有一个源的话，
 # vpngate.net 被墙或抽风就是 9 条通道一起没节点可用、重启后连缓存都没有。
@@ -252,6 +262,7 @@ class Channel:
         self.node_location = ""
         self.node_ip_type = ""
         self.node_ip_reason = ""
+        self.node_ip_confidence = ""
         self.node_latency = 0
         self.process: subprocess.Popen[str] | None = None
         self.error = ""
@@ -279,6 +290,7 @@ class Channel:
              "node_country": self.node_country, "node_owner": self.node_owner,
              "node_location": self.node_location, "node_ip_type": self.node_ip_type,
              "node_ip_reason": self.node_ip_reason,
+             "node_ip_confidence": self.node_ip_confidence,
              "ip_reused": self.ip_reused, "reserved_ip": self.reserved_ip,
              "node_latency": self.node_latency, "error": self.error,
              "speed_testing": self.speed_testing, "speed_mbps": self.speed_mbps,
@@ -880,6 +892,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         ch.node_location = node.get("location","")
         ch.node_ip_type = node.get("ip_type","")
         ch.node_ip_reason = node.get("ip_reason","")
+        ch.node_ip_confidence = node.get("ip_confidence","")
         ch.error = ""
     config_text = node.get("config_text","")
     config_path = CONFIG_DIR / f"ch{ch.index}.ovpn"
@@ -959,7 +972,8 @@ def disconnect_channel(ch: Channel):
         cleanup_policy_routing(policy_table(ch.index))
         ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
         ch.node_country = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
-        ch.node_ip_reason = ""; ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0
+        ch.node_ip_reason = ""; ch.node_ip_confidence = ""
+        ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0
         release_slot(ch)
         # Keep config file for watchdog retry
     log(f"[CH{ch.index}] Disconnected")
@@ -1027,6 +1041,19 @@ def start_all_proxies() -> dict[int, str]:
 # === Node Fetching ===
 _last_fetch_source = ""      # 最近一次节点数据的来源（在线地址 / snapshot / 空）
 _snapshot_saved_at = 0.0     # 本地快照的保存时间（内存里记一份，避免状态接口每次都读大文件）
+_ui_tls_info: dict | None = None   # 面板证书信息（None = 面板跑在明文 HTTP 上）
+
+
+def ui_tls_status() -> dict[str, Any]:
+    """面板的传输加密状态。证书信息在启动时算好，这里只做格式化，不碰磁盘。"""
+    info = _ui_tls_info
+    days = info.get("days_left") if info else None
+    return {
+        "ui_scheme": "https" if info else "http",
+        "ui_tls_source": (info or {}).get("source", ""),
+        "ui_cert_self_signed": bool((info or {}).get("self_signed")),
+        "ui_cert_days": int(days) if isinstance(days, (int, float)) else None,
+    }
 
 def _parse_vpngate_csv(raw: str) -> list[dict[str, Any]]:
     """解析 VPNGate 返回的 CSV 文本，按"延迟+速度"粗排。"""
@@ -1185,6 +1212,12 @@ def collector_loop():
             refresh_nodes_once("fetch")
         except Exception as e:
             log(f"[collector] Error: {e}")
+        try:
+            # 证书快过期时在日志里提醒。结果在 ui_tls 里缓存一小时，
+            # 不会每轮都去解析证书文件。
+            ui_tls.warn_if_expiring(log=log, data_dir=DATA_DIR)
+        except Exception:
+            pass
         time.sleep(FETCH_INTERVAL)
 
 # === Channel Manager ===
@@ -1213,15 +1246,13 @@ def occupied_ips(exclude_ch: "Channel | None" = None) -> set[str]:
 def country_supply(ip_type: str = "") -> dict[str, dict[str, int]]:
     """各国节点供给统计，用于面板提示"这个国家还剩多少可用 IP"。
 
-    返回 {国家: {total, residential, mobile, hosting, used}}；used 含预占中的通道。
+    返回 {国家: {total, residential, mobile, hosting, unknown, used}}；used 含预占中的通道。
     """
     with nodes_cache_lock:
         pool = list(nodes_cache)
     used = set(occupied_map())
-    try:
-        key = {"residential": "residential", "mobile": "mobile", "hosting": "hosting"}[ip_type]
-    except KeyError:
-        key = ""
+    # unknown 也要能筛：判定不出类型的节点在面板上是"未知"，不是"住宅"
+    key = ip_type if ip_type in IP_TYPE_KEYS else ""
     out: dict[str, dict[str, int]] = {}
     for n in pool:
         if key and (n.get("ip_type") or "") != key:
@@ -1230,7 +1261,7 @@ def country_supply(ip_type: str = "") -> dict[str, dict[str, int]]:
         if not cname:
             continue
         e = out.setdefault(cname, {"total": 0, "residential": 0, "mobile": 0,
-                                   "hosting": 0, "used": 0})
+                                   "hosting": 0, "unknown": 0, "used": 0})
         e["total"] += 1
         t = n.get("ip_type") or ""
         if t in e:
@@ -1268,7 +1299,7 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
         if typed:
             pool = typed
         else:
-            warnings.append(f"当前没有「{ip_type}」类型的节点，本次已忽略 IP 类型限制")
+            warnings.append(f"当前没有「{ip_type_label(ip_type)}」类型的节点，本次已忽略 IP 类型限制")
 
     # 本次要重新分配的通道，它们原先占的 IP 可以回收
     target_ids = {c.index for c in targets}
@@ -1623,7 +1654,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <option value="untested">未实测</option>
     </select>
     <select id="f_country"><option value="">所有国家</option></select>
-    <select id="f_type"><option value="">所有IP类型</option><option value="residential">住宅IP</option><option value="hosting">机房IP</option></select>
+    <select id="f_type"><option value="">所有IP类型</option><option value="residential">住宅IP</option><option value="hosting">机房IP</option><option value="mobile">移动IP</option><option value="unknown">未知</option></select>
     <select id="f_sort" title="排序方式">
       <option value="">默认排序</option>
       <option value="new">最新发现优先</option>
@@ -1672,6 +1703,19 @@ var _CS={},_CTRY=[];  // /api/status 带回的国家供给统计，供"全部通
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(m){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
 
+// IP 类型：英文值一律只在内部用，界面上统一走这三个函数，
+// 免得又把 'residential' / 'unknown' 原样漏到页面上。
+function ipTypeLabel(t){
+  return t==='residential'?'住宅':t==='hosting'?'机房':t==='mobile'?'移动':
+         t==='unknown'?'未知':(t||'-');
+}
+function ipTypeCls(t){
+  return t==='residential'?'tp r':t==='hosting'?'tp h':t==='mobile'?'tp m':'tp u';
+}
+function confLabel(c){
+  return c==='high'?'置信度高':c==='medium'?'置信度中':c==='low'?'置信度低':'';
+}
+
 // 出口 IP 与其它通道重复时给个醒目提示（多出口场景下重复 = 白开一条通道）
 function dupTag(c,d){
   if(c.ip_dup_with&&c.ip_dup_with.length){
@@ -1696,8 +1740,8 @@ function render(d){
     var cls=c.state==='connected'?'card on':c.state==='connecting'?'card bz':c.state==='error'?'card fail':'card';
     var dt=c.state==='connected'?'g':c.state==='connecting'?'y':c.state==='error'?'r':'g2';
     var st={connected:'已连接',connecting:'连接中',disconnected:'未连接',error:'错误'}[c.state]||c.state;
-    var it=c.node_ip_type;
-    var ipc=c.node_ip_type==='residential'?'tp r':c.node_ip_type==='hosting'?'tp h':c.node_ip_type==='mobile'?'tp m':'tp u';
+    var it=ipTypeLabel(c.node_ip_type);
+    var ipc=ipTypeCls(c.node_ip_type);
     h+='<div class="'+cls+'"><div class="chf"><div class="ct"><span class="cn">CH'+c.index+'</span><span class="dt '+dt+'"></span>'+st+'</div><span style="font-size:10px;color:#6b7280">'+c.tun+'</span></div>';
     h+='<div class="bd"><div class="i"><span class="ll">出口IP</span><span>'+ (c.node_ip||'-') +'</span>'+ dupTag(c,d) +'</div>';
     var ctryShown=c.node_country||c.force_country||'';
@@ -1705,7 +1749,10 @@ function render(d){
     h+='<div class="i"><span class="ll">位置</span><span style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ (c.node_location||'-') +'</span></div>';
     h+='<div class="i"><span class="ll">运营主体</span><span class="ow" title="'+c.node_owner+'">'+ (c.node_owner||'-') +'</span></div>';
     h+='<div class="i"><span class="ll">IP类型</span><span'+(ipc?' class="'+ipc+'"':'')+'>'+ (it||'-') +'</span></div>';
-    if(c.node_ip_reason) h+='<div class="i"><span class="ll">判定依据</span><span class="ow" title="'+String(c.node_ip_reason).replace(/["<>]/g,'')+'">'+c.node_ip_reason+'</span></div>';
+    if(c.node_ip_reason){
+      var cf=confLabel(c.node_ip_confidence);
+      h+='<div class="i"><span class="ll">判定依据</span><span class="ow" title="'+String(c.node_ip_reason).replace(/["<>]/g,'')+'">'+c.node_ip_reason+(cf?' · '+cf:'')+'</span></div>';
+    }
     h+='<div class="i"><span class="ll">延迟</span><span>'+ (c.node_latency>0?c.node_latency+'ms':'-') +'</span></div>';
     if(c.speed_testing){
       h+='<div class="i"><span class="ll">实测带宽</span><span style="color:#818cf8">测速中...</span></div>';
@@ -1737,7 +1784,8 @@ function render(d){
     h+='<select id="ipt_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
     h+='<option value="">全部IP</option><option value="residential"'+(savedIpt==='residential'||c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
     h+='<option value="hosting"'+(savedIpt==='hosting'||c.force_ip_type==='hosting'?' selected':'')+'>机房</option>';
-    h+='<option value="mobile"'+(savedIpt==='mobile'||c.force_ip_type==='mobile'?' selected':'')+'>移动</option></select>';
+    h+='<option value="mobile"'+(savedIpt==='mobile'||c.force_ip_type==='mobile'?' selected':'')+'>移动</option>';
+    h+='<option value="unknown"'+(savedIpt==='unknown'||c.force_ip_type==='unknown'?' selected':'')+'>未知</option></select>';
     h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'||c.state==='connected'?' disabled':'')+'>连接</button>';
     h+='<button class="btn" onclick="chSpeed('+c.index+')"'+(c.state==='connected'&&!c.speed_testing?'':' disabled')+'>'+(c.speed_testing?'测速中':'测速')+'</button>';
     h+='<button class="btn d" onclick="dc('+c.index+')"'+(c.state!=='connected'||c.speed_testing?' disabled':'')+'>断开</button>';
@@ -1856,7 +1904,7 @@ async function refreshNodes(){
       var n=d.nodes[i];
       var av=n.available?'sta ok':'sta no';
       var avt=n.available?'可用':'不可用';
-      var ipc=n.ip_type==='residential'?'tp r':n.ip_type==='hosting'?'tp h':n.ip_type==='mobile'?'tp m':'tp u';
+      var ipc=ipTypeCls(n.ip_type);
       var newTag=n.is_new?(' <span class="bnw" title="首现于 '+fmtAge(n.new_age_s)+'">新</span>'):'';
       h+='<tr class="'+(n.is_new?'isnew':'')+'">';
       h+='<td><input type="checkbox" class="cb" data-nid="'+esc(n.id)+'"'+(CK[n.id]?' checked':'')+' onchange="ckNode(this)"></td>';
@@ -1864,9 +1912,9 @@ async function refreshNodes(){
       h+='<td>'+newTag+n.ip+':'+n.port+'</td>';
       h+='<td class="ow" title="'+esc(n.location)+'">'+(n.location||'-')+'</td>';
       h+='<td class="ow" title="'+esc(n.owner)+'">'+(n.owner||'-')+'</td>';
-      var tip=(n.ip_reason||'')+(n.is_vpn_exit?' / VPN出口IP':'');
+      var tip=(n.ip_reason||'')+(confLabel(n.ip_confidence)?' · '+confLabel(n.ip_confidence):'')+(n.is_vpn_exit?' / VPN出口IP':'');
       tip=String(tip).replace(/["<>]/g,'');
-      h+='<td>'+(n.ip_type?'<span class="'+ipc+'" title="'+tip+'">'+(n.ip_type==='residential'?'住宅':n.ip_type==='hosting'?'机房':n.ip_type)+'</span>':'-')+'</td>';
+      h+='<td>'+(n.ip_type?'<span class="'+ipc+'" title="'+tip+'">'+ipTypeLabel(n.ip_type)+'</span>':'-')+'</td>';
       // 实测延迟：测过但不通给红色"不通"，没测过是灰色 "-"
       if(n.tcp_latency>0) h+='<td>'+n.tcp_latency+' ms</td>';
       else if(n.tcp_latency_at) h+='<td><span style="color:#ef4444">不通</span></td>';
@@ -2023,7 +2071,7 @@ loadCountries(); refreshNodes();
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
     <span style="font-size:12px;color:#9ca3af">出口 IP 类型</span>
     <select id="as_ipt" onchange="previewAssign()" style="padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none">
-      <option value="">不限</option><option value="residential">住宅</option><option value="hosting">机房</option><option value="mobile">移动</option>
+      <option value="">不限</option><option value="residential">住宅</option><option value="hosting">机房</option><option value="mobile">移动</option><option value="unknown">未知</option>
     </select>
     <span style="font-size:12px;color:#9ca3af">分配通道数</span>
     <select id="as_count" onchange="previewAssign()" style="padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none">
@@ -2298,7 +2346,8 @@ class Handler(BaseHTTPRequestHandler):
                             "speed_task":speed_task,
                             "nodes_source":_last_fetch_source,
                             "nodes_snapshot_at":_snapshot_saved_at,
-                            "policy_table_base":POLICY_TABLE_BASE})
+                            "policy_table_base":POLICY_TABLE_BASE,
+                            **ui_tls_status()})
         elif path == "/api/nodes":
             filter_type = params.get("filter",[""])[0]
             country = params.get("country",[""])[0]
@@ -2330,6 +2379,7 @@ class Handler(BaseHTTPRequestHandler):
                     "country_long": n_country, "available": available,
                     "location": n.get("location",""), "owner": n.get("owner",""),
                     "ip_type": n_ip_type, "asn": n.get("asn",""),
+                    "ip_confidence": n.get("ip_confidence",""),
                     "ip_reason": n.get("ip_reason",""),
                     "is_vpn_exit": n.get("is_vpn_exit", False),
                     "is_new": is_new,
@@ -2806,11 +2856,28 @@ def main():
                 time.sleep(2)
     class DualStackServer(ThreadingHTTPServer):
         allow_reuse_address = True
-    log(f"[UI] http://{UI_HOST}:{UI_PORT}/")
+    # 面板加密：优先复用机器上已有的证书（s-ui / acme.sh / Let's Encrypt…），
+    # 没有才自签。找不到可用的就继续明文 HTTP —— 证书问题绝不能让面板起不来。
+    global _ui_tls_info
+    _ui_tls_info = ui_tls.setup(DATA_DIR)
+    if _ui_tls_info:
+        log(f"[UI] https://{UI_HOST}:{UI_PORT}/  {ui_tls.cert_summary(_ui_tls_info)}")
+    else:
+        log(f"[UI] http://{UI_HOST}:{UI_PORT}/  （明文，未启用 HTTPS）")
     try:
-        server = DualStackServer((UI_HOST, UI_PORT), Handler); server.serve_forever()
+        server = DualStackServer((UI_HOST, UI_PORT), Handler)
     except Exception:
-        server = DualStackServer(("0.0.0.0", UI_PORT), Handler); server.serve_forever()
+        server = DualStackServer(("0.0.0.0", UI_PORT), Handler)
+    if _ui_tls_info:
+        try:
+            # 必须用 wrap_socket 包住监听套接字本身；写在 Handler 里没有
+            # server_side 的上下文，握手阶段就失败了。
+            server.socket = _ui_tls_info["context"].wrap_socket(
+                server.socket, server_side=True)
+        except Exception as e:
+            log(f"[UI] HTTPS 包装失败，退回明文 HTTP: {e}")
+            _ui_tls_info = None
+    server.serve_forever()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("--set-credentials", "--set-password"):
@@ -2827,6 +2894,7 @@ if __name__ == "__main__":
         save_auth_config(new_user, new_pwd)
         load_or_create_guard_token()
         print(f"已更新管理凭据: 账号 {new_user}")
+        print(f"面板地址: {ui_tls.describe(DATA_DIR)['scheme']}://<服务器IP>:{UI_PORT}/")
         print("请重启面板生效: systemctl restart michaelvpn")
         sys.exit(0)
     main()

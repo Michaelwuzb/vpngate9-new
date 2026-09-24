@@ -27,7 +27,10 @@ FIX = _find_src(SRC)
 WORK = tempfile.mkdtemp(prefix="vg9js_")
 ROOT = os.path.join(WORK, "opt").replace("\\", "/")
 
-for f in ("vpngate9_multi.py", "vpn_utils.py", "proxy_server_multi.py", "speedtest_utils.py"):
+# 自动收集源码目录里的全部模块：以后再加模块（比如 ui_tls.py）不必回来改这里，
+# 漏改的表现是测试以 ModuleNotFoundError 直接崩掉，容易被当成代码坏了。
+_SRC_MODULES = sorted(n for n in os.listdir(FIX) if n.endswith('.py'))
+for f in _SRC_MODULES:
     txt = open(os.path.join(FIX, f), encoding="utf-8").read()
     txt = txt.replace('Path("/opt/michaelvpn")', 'Path(r"%s")' % ROOT)
     txt = txt.replace('UI_HOST = "::"', 'UI_HOST = "127.0.0.1"')

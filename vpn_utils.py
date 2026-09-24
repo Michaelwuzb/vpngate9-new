@@ -433,9 +433,10 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
 #   2) `hosting` 字段漏报严重：实测 98 个节点里只有 2 个为 true，连 DigitalOcean、
 #      SoftEther 自建服务器这种明确的机房都标 false。
 # 所以改为「ASN/机构关键词 + PTR 反向域名特征」为主，ip-api 标记只作最后兜底。
+# 两轮证据都不成立时给 unknown + 低置信度，不再兜底成"住宅"充数。
 # 改动判定规则后请把 _CLS_VER 加一，旧缓存会自动失效重查。
 # ============================================================================
-_CLS_VER = 4
+_CLS_VER = 5
 _IP_API_FIELDS = "status,message,query,country,regionName,city,isp,org,as,asname,hosting,mobile,proxy"
 
 # 云 / 机房 / IDC 特征（机构名、ISP 名、AS 名里出现即判机房）
@@ -511,13 +512,35 @@ def _kw_hit(blob: str, keys: tuple[str, ...]) -> str:
     return ""
 
 
+# 置信度：判定所依据的证据强弱。前端把它显示在判定依据里，用户自己决定信几分。
+CONF_HIGH = "high"       # 机构名（ISP / 组织 / AS 名）里直接命中关键词
+CONF_MEDIUM = "medium"   # 靠 PTR 反查域名特征，或 ip-api 的 hosting/mobile 标记
+CONF_LOW = "low"         # 无任何特征可用 —— 这种情况一律 unknown，不再硬猜成住宅
+
+CONF_TEXT = {"high": "高", "medium": "中", "low": "低"}
+
+
+def _brief(value: str, limit: int = 42) -> str:
+    """把 ISP / PTR 原文截短，避免判定依据那一列被撑爆。"""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def classify_ip_type(isp: str, org: str, asname: str, ptr: str = "",
                      flag_hosting: bool = False, flag_mobile: bool = False,
-                     ) -> tuple[str, str, bool]:
-    """判定节点 IP 类型，返回 (ip_type, reason, need_ptr)。
+                     ) -> tuple[str, str, bool, str]:
+    """判定节点 IP 类型，返回 (ip_type, reason, need_ptr, confidence)。
 
-    ip_type 取值: residential(住宅/家宽) / hosting(机房) / mobile(移动)
+    ip_type 取值: residential(住宅/家宽) / hosting(机房) / mobile(移动) / unknown(判不出来)
+    confidence 取值: high / medium / low
     need_ptr 为 True 表示机构关键词没给出结论，建议再用 PTR 反查一次。
+
+    关于 unknown（相对旧版的行为变化）：
+      旧版在"机构名和 PTR 都没有特征"时一律兜底成 residential，于是面板上"住宅"
+      里混着一批其实毫无依据的节点。现在改成 unknown + 低置信度，理由里带上
+      ISP/PTR 原文——宁可显示"不知道"，也不要假装知道。
+      注意：unknown 只是"没判出来"，不影响节点可用性，也不影响自动分配
+      （不指定 IP 类型时照样参与挑选）。
     """
     blob = " ".join([isp or "", org or "", asname or ""]).lower()
     ptr_l = (ptr or "").lower()
@@ -525,35 +548,44 @@ def classify_ip_type(isp: str, org: str, asname: str, ptr: str = "",
     # 1) 移动网络优先（"SoftBank Mobile" / "NTT Docomo" / AIS 等）
     hit = _kw_hit(blob, MOBILE_KEYS)
     if hit:
-        return "mobile", f"机构关键词命中移动运营商({hit})", False
+        return "mobile", f"机构关键词命中移动运营商({hit})", False, CONF_HIGH
 
     # 2) 云 / 机房 / IDC
     hit = _kw_hit(blob, HOSTING_KEYS)
     if hit:
-        return "hosting", f"机构关键词命中机房/云({hit})", False
+        return "hosting", f"机构关键词命中机房/云({hit})", False, CONF_HIGH
 
     # 3) 消费级宽带 ISP -> 家宽
     hit = _kw_hit(blob, RESIDENTIAL_ISP_KEYS)
     if hit:
-        return "residential", f"机构关键词命中宽带运营商({hit})", False
+        return "residential", f"机构关键词命中宽带运营商({hit})", False, CONF_HIGH
 
     # 4) 关键词没结论，交给 PTR 反查
     if not ptr:
-        return "residential", "待定(需 PTR 反查)", True
+        detail = _brief(isp or org or asname)
+        reason = (f"机构名无特征({detail})，且无 PTR 记录" if detail
+                  else "运营商信息缺失，且无 PTR 记录")
+        return "unknown", reason, True, CONF_LOW
 
     hit = _kw_hit(ptr_l, RESIDENTIAL_PTR_KEYS)
     if hit:
-        return "residential", f"PTR 命中家宽/动态地址特征({hit})", False
+        return "residential", f"PTR 命中家宽/动态地址特征({hit})", False, CONF_MEDIUM
     hit = _kw_hit(ptr_l, HOSTING_PTR_KEYS)
     if hit:
-        return "hosting", f"PTR 命中机房特征({hit})", False
+        return "hosting", f"PTR 命中机房特征({hit})", False, CONF_MEDIUM
 
     # 5) 兜底才用 ip-api 标记（hosting 漏报，proxy 不可用于判类型）
     if flag_hosting:
-        return "hosting", "ip-api hosting 标记兜底", False
+        return "hosting", "ip-api hosting 标记兜底", False, CONF_MEDIUM
     if flag_mobile:
-        return "mobile", "ip-api mobile 标记兜底", False
-    return "residential", "无明确机房特征，默认按家宽处理", False
+        return "mobile", "ip-api mobile 标记兜底", False, CONF_MEDIUM
+
+    # 6) 实在没有依据 —— 明确说"不知道"，别硬塞进住宅
+    detail = _brief(isp or org or asname)
+    ptr_txt = _brief(ptr)
+    reason = (f"机构名({detail})与 PTR({ptr_txt})均无明确特征" if detail
+              else f"运营商信息缺失，PTR({ptr_txt})也无特征")
+    return "unknown", reason, False, CONF_LOW
 
 
 def _resolve_ptr(ips: list[str], timeout: float = 6.0, workers: int = 8,
@@ -603,6 +635,7 @@ def _apply_cache_entry(node: dict[str, Any], cached: dict[str, Any]) -> None:
     node["ip_type"] = cached.get("ip_type", "")
     node["quality"] = cached.get("quality", cached.get("ip_type", ""))
     node["ip_reason"] = cached.get("ip_reason", "")
+    node["ip_confidence"] = cached.get("ip_confidence", "")
     node["ptr"] = cached.get("ptr", "")
     node["is_vpn_exit"] = cached.get("is_vpn_exit", False)
 
@@ -663,14 +696,14 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         return
 
     # 3. 先按机构关键词判定；关键词给不出结论的，再用 PTR 反查兜底
-    preliminary: dict[str, tuple[str, str]] = {}
+    preliminary: dict[str, tuple[str, str, str]] = {}
     need_ptr: list[str] = []
     for qip, item in raw_records.items():
-        ip_type, reason, want_ptr = classify_ip_type(
+        ip_type, reason, want_ptr, conf = classify_ip_type(
             item.get("isp", ""), item.get("org", ""), item.get("asname", ""),
             flag_hosting=bool(item.get("hosting")), flag_mobile=bool(item.get("mobile")),
         )
-        preliminary[qip] = (ip_type, reason)
+        preliminary[qip] = (ip_type, reason, conf)
         if want_ptr:
             need_ptr.append(qip)
 
@@ -682,15 +715,14 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     for qip, item in raw_records.items():
         ptr = ptr_map.get(qip, "")
         if qip in ptr_map:
-            ip_type, reason, _ = classify_ip_type(
+            ip_type, reason, _, conf = classify_ip_type(
                 item.get("isp", ""), item.get("org", ""), item.get("asname", ""), ptr,
                 flag_hosting=bool(item.get("hosting")), flag_mobile=bool(item.get("mobile")),
             )
         else:
-            ip_type, reason = preliminary[qip]
-            if not ptr:
-                reason = reason.replace("待定(需 PTR 反查)",
-                                        "待定(PTR 无结果，按家宽处理)")
+            # PTR 没查到（DNS 没反解 / 超时）—— reason 里已经写明"无 PTR 记录"，
+            # 也就是 unknown + 低置信度，不再改写成"按家宽处理"。
+            ip_type, reason, conf = preliminary[qip]
 
         loc = " ".join(part for part in
                        [item.get("country"), item.get("regionName"), item.get("city")] if part)
@@ -703,6 +735,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             "ip_type": ip_type,
             "quality": ip_type,
             "ip_reason": reason,
+            "ip_confidence": conf,
             "ptr": ptr,
             # 注意：proxy=true 只代表"这是个 VPN/代理出口"，与家宽/机房无关，
             # 单独存成一个标记给面板显示，不再参与类型判定。

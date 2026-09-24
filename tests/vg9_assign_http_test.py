@@ -40,8 +40,10 @@ def check(name, ok, extra=""):
     else:
         FAIL += 1; print(f"  [FAIL] {name}  {extra}")
 
-for f in ("vpngate9_multi.py", "vpn_utils.py", "proxy_server_multi.py",
-          "speedtest_utils.py"):
+# 自动收集源码目录里的全部模块：以后再加模块（比如 ui_tls.py）不必回来改这里，
+# 漏改的表现是测试以 ModuleNotFoundError 直接崩掉，容易被当成代码坏了。
+_SRC_MODULES = sorted(n for n in os.listdir(FIX) if n.endswith('.py'))
+for f in _SRC_MODULES:
     txt = open(os.path.join(FIX, f), encoding="utf-8").read()
     txt = txt.replace('Path("/opt/michaelvpn")', f'Path(r"{ROOT}")')
     txt = txt.replace('UI_HOST = "::"', 'UI_HOST = "127.0.0.1"')
@@ -50,6 +52,9 @@ for f in ("vpngate9_multi.py", "vpn_utils.py", "proxy_server_multi.py",
 
 env = dict(os.environ)
 env["no_proxy"] = env["NO_PROXY"] = "127.0.0.1,localhost"
+# 本测试只验证 HTTP 接口，不测 TLS。面板默认会启用 HTTPS（复用现成证书或自签），
+# 那样明文请求会连不上，所以这里显式关掉——TLS 的覆盖在 tests/vg9_https_test.py 里。
+env["VPNGATE_UI_TLS"] = "off"
 
 op = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                 urllib.request.HTTPCookieProcessor())
@@ -109,6 +114,7 @@ try:
 
     print("\n[3] 等节点池就绪")
     ok_nodes = False
+    st = {}   # 一次都没成功后面对 st 取值的断言不该以 NameError 收场，那会把真实失败原因盖掉
     for _ in range(120):
         code, txt = call("GET", "/api/status", cookie=cookie)
         try:

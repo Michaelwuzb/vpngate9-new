@@ -11,7 +11,11 @@
 bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9-new/main/install.sh)
 ```
 
-安装后访问 `http://<VPS_IP>:8787/` 进入管理面板。
+安装后访问 `https://<VPS_IP>:8787/` 进入管理面板。
+面板**默认就走 HTTPS**：优先复用这台机器上已有的证书（s-ui / acme.sh / Let's Encrypt / 宝塔
+的证书都认），找不到才自签一份。自签时浏览器会提示"不安全"，点继续访问即可；
+想用受信任的证书，见下方 [面板 HTTPS](#-面板-https) 一节。
+
 默认账号密码从 `ui_auth.json` 读取，可在 `/opt/michaelvpn/vpngate_data/ui_auth.json` 中修改。
 
 ## 🗑️ 一键卸载
@@ -28,7 +32,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9-new/main/
 
 ### 1. 登录管理面板
 
-浏览器打开 `http://<VPS_IP>:8787/`，输入账号密码登录。
+浏览器打开 `https://<VPS_IP>:8787/`，输入账号密码登录。
+（面板默认 HTTPS；如果你显式关掉了 TLS，那就是 `http://`，看下面那节。）
 
 ### 2. 获取节点
 
@@ -69,11 +74,13 @@ curl ifconfig.me  # 显示日本 IP
 ## 🎛️ 管理命令
 
 ```bash
-ml status   # 查看9通道状态
-ml restart  # 重启服务
-ml logs     # 查看实时日志
-ml stop     # 停止服务
-ml start    # 启动服务
+ml status   # 查看9通道状态（会自动按 http/https 探测面板）
+ml restart  # 重启面板 + 守护
+ml logs     # 查看面板实时日志
+ml guard    # 查看守护服务状态
+ml guardlogs# 查看守护实时日志
+ml stop     # 停止面板 + 守护
+ml start    # 启动面板 + 守护
 ml passwd <新密码>            # 改面板密码（忘记密码时的救援入口）
 ml passwd <新账号> <新密码>    # 同时改面板账号和密码
 ```
@@ -172,7 +179,7 @@ ml passwd <新账号> <新密码>    # 同时改面板账号和密码
 ### IP 信息富集
 - 物理位置（国家、地区、城市）
 - 运营主体 / ISP（如 KDDI、SoftEther、LG Uplus）
-- IP 类型（住宅、机房、移动）
+- IP 类型（住宅、机房、移动、**未知**）+ **置信度**（高 / 中 / 低）
 - 数据来源：ip-api.com + 本地 PTR 反查
 
 > **IP 类型是怎么判的（重要）**
@@ -182,14 +189,67 @@ ml passwd <新账号> <新密码>    # 同时改面板账号和密码
 > - `hosting` 字段漏报严重：实测 98 个节点里只有 2 个为 true，连 DigitalOcean、SoftEther 自家服务器都标 false。
 >
 > 所以本项目改为「ASN/机构关键词 + PTR 反向域名特征」为主：
-> 1. 先看 ASN/ISP/机构名里的移动运营商特征 → 移动
-> 2. 再看云/机房/IDC 特征（digitalocean、softether、hosted、hosting…）→ 机房
-> 3. 再看消费级宽带运营商特征（softbank、kddi、korea telecom、virgin media…）→ 住宅
-> 4. 关键词判不出来的（一般是小运营商），再做一次 PTR 反查，看是不是 `*.bbtec.net`、`*.dynamic.*`、`*-pool-*` 这类家宽/动态池特征
-> 5. 都没结论时才退回 ip-api 标记，最后默认按住宅处理
+> 1. 先看 ASN/ISP/机构名里的移动运营商特征 → 移动（置信度**高**）
+> 2. 再看云/机房/IDC 特征（digitalocean、softether、hosted、hosting…）→ 机房（**高**）
+> 3. 再看消费级宽带运营商特征（softbank、kddi、korea telecom、virgin media…）→ 住宅（**高**）
+> 4. 关键词判不出来的（一般是小运营商），再做一次 PTR 反查，看是不是 `*.bbtec.net`、`*.dynamic.*`、`*-pool-*` 这类家宽/动态池特征 → 住宅/机房（**中**）
+> 5. 都没有时才退回 ip-api 的 hosting/mobile 标记（**中**）
+> 6. **还是没有依据 → 标成「未知」+ 低置信度，不再假装是住宅**
+>
+> 第 6 条是刻意的：过去这种情况一律兜底成"住宅"，于是"住宅"里混着一批其实毫无依据的
+> 节点。现在宁可显示"不知道"——判定依据那一列会把 ISP 和 PTR 原文带出来，你自己一眼
+> 就能判断。**「未知」只是没判出来，不影响节点可用性，也不影响不指定类型时的自动分配。**
+> 想只看有把握的：按类型筛选时选"住宅"，或在节点表里按"未知"单独查看。
 >
 > 判定规则在 `vpn_utils.py` 顶部的关键词表里，想加自己的 ISP 直接往对应元组里塞就行；
 > 改完把 `_CLS_VER` 加一，旧缓存会自动失效并重新查询。
+
+### 面板 HTTPS
+
+面板**默认启用 HTTPS**。证书按这个顺序找，找到哪个用哪个：
+
+1. **你在 `ui_tls.json` 或环境变量里显式指定的** `cert` / `key`
+2. **这台机器上现成的证书**，按下面的顺序扫：
+   - `/usr/local/s-ui/cert/` ← **s-ui 默认就在这**（面板里用 acme.sh 签发的证书落在这里），
+     Docker 部署的 s-ui 则是 `/etc/s-ui/cert/`
+   - `/root/.acme.sh/<域名>[_ecc]/`（acme.sh）
+   - `/etc/letsencrypt/live/<域名>/`（certbot）
+   - `/www/server/panel/vhost/cert/<域名>/`（宝塔）
+   - Xray / sing-box / v2ray-agent 的证书目录、`/root/cert/`
+3. 都没有 → 用 `openssl` **自签**一份，放 `vpngate_data/ui_cert/`（有效期 825 天，临期自动重签）
+
+几个已经处理掉的坑：
+
+- **不碰别人的证书**：只读。自签产物只写在自己的目录里
+- **过期和公私钥不匹配的证书会被跳过**，不会拿去用（否则是握手时才炸）
+- **`.key` / `chain.pem` 这类文件不会被误当成证书**
+- 复用 s-ui 的证书 = 你那个域名的证书直接生效，浏览器是绿的；**证书续期后重启一下面板即可**
+- 面板跑 HTTPS 时，`ml status` / `ml logs` / 守护脚本都会**自动切到 https**，不用你改配置
+
+想让面板换个域名的证书，或者干脆用回明文：
+
+```bash
+vi /opt/michaelvpn/vpngate_data/ui_tls.json
+```
+```json
+{
+  "enabled": "auto",
+  "cert": "/usr/local/s-ui/cert/fullchain.pem",
+  "key": "/usr/local/s-ui/cert/privkey.pem"
+}
+```
+
+| 配置项 | 环境变量 | 说明 |
+|---|---|---|
+| `enabled` | `VPNGATE_UI_TLS` | `auto`（默认，等价于"能上就上"）/ `off`（强制明文 http） |
+| `cert` / `key` | `VPNGATE_UI_CERT` / `VPNGATE_UI_KEY` | 指定证书和私钥路径，优先级最高 |
+| `domain` | `VPNGATE_UI_DOMAIN` | 自签时用的域名（默认取本机 FQDN） |
+| `cert_dirs` | `VPNGATE_UI_CERT_DIRS` | 追加扫描目录（逗号分隔），放你自己的证书 |
+| — | `VPNGATE_UI_TLS=off` | 关掉 HTTPS，回到明文 http |
+
+> 自签证书浏览器会报"不安全"——这是自签的必然结果，不是配置错了。
+> 想要绿锁就得让域名和证书对上：把受信任的证书放到 `/usr/local/s-ui/cert/`，
+> 或者用 `cert`/`key` 指过去，然后 `ml restart`。
 
 ### 安全登录
 - 账号密码认证，密码以 **PBKDF2-SHA256 哈希**存储（旧版明文会在首次启动时自动升级）
@@ -250,6 +310,10 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 ## ⚠️ 常见问题
 
 ### Web UI 无法访问
+- **先确认协议**：面板默认是 `https://<IP>:8787/`。用 `http://` 打开会连不上（不是被墙，是协议不对）。
+  实际用的是哪个，看 `ml status` 输出的第一行，或看日志里的 `[UI] https://...`
+- 自签证书被浏览器拦下时，点"继续访问"；这不是配置错误
+- 想换回明文：`VPNGATE_UI_TLS=off`（写进 systemd 的 `Environment=`），或 `ui_tls.json` 里 `"enabled": false`
 - 检查防火墙：`ufw allow 8787/tcp && ufw allow 47928/tcp`
 - 云服务商安全组放行 8787、47928~47936 端口
 
@@ -282,7 +346,9 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 ### IP类型显示不准（比如家宽被标成"机房"）
 
 - 已修复根因：旧版把 ip-api 的 `proxy=true`（"这是 VPN 出口"标记）当成机房判据，导致 SoftBank / KT 这类家宽全被标成机房。
-- 现在改为按机构关键词 + PTR 判定，并把判定依据显示在面板上。
+- 现在改为按机构关键词 + PTR 判定，并把判定依据和**置信度**显示在面板上。
+- **看到"未知"是正常的**：机构名和 PTR 都没有特征时不再硬猜成住宅（过去这样会虚增"住宅"数量）。
+  "未知"不影响节点可用性，也不影响不指定类型时的自动分配。
 - 某个小众运营商仍判错时：在 `vpn_utils.py` 的 `RESIDENTIAL_ISP_KEYS` / `HOSTING_KEYS` 里补关键词，然后把 `_CLS_VER` 加一（旧缓存会自动失效重查）。
 - 想立刻强制重判：删掉 `/opt/michaelvpn/vpngate_data/ip_cache.json`，再点面板"刷新"。
 
@@ -310,8 +376,9 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 ├── vpngate9_multi.py      # 9通道管理器
 ├── proxy_server_multi.py  # 多通道代理
 ├── vpn_utils.py           # IP信息富集
+├── ui_tls.py              # 面板 HTTPS：证书发现 / 自签（纯标准库 + openssl 命令行）
 ├── speedtest_utils.py     # 测速（SOCKS5 + HTTP 下载，纯标准库）
-├── vpngate9_guard.py      # 通道守护脚本（可选）
+├── vpngate9_guard.py      # 通道守护脚本（install.sh 会自动装成服务）
 ├── install.sh             # 部署脚本
 ├── LICENSE                # GPL-3.0 许可证全文
 ├── NOTICE                 # 来源、衍生关系与改造说明
@@ -324,6 +391,8 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 │   ├── ip_cache.json      # IP 信息缓存
 │   ├── nodes_seen.json    # 节点首现时间记录（判断"新节点"的基准）
 │   ├── nodes_snapshot.json# 上次成功拉取的完整节点（含配置，供源不可用时回退）
+│   ├── ui_tls.json        # 面板 HTTPS 配置（可选，不写就自动找证书）
+│   ├── ui_cert/           # 自签证书（没有现成证书时才生成，私钥 chmod 600）
 │   └── nodes.json         # 节点缓存（含实测延迟 / 实测带宽，刷新时按 id 合并保留）
 ```
 
@@ -357,26 +426,26 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 
 ### 安装
 
+**不用手动装** —— `install.sh` 会自动把守护写成 `vpngate9-guard.service` 并启动，
+排在被守护的面板服务之后启动，崩溃无限重启。装完会告诉你它有没有跑起来：
+
+```bash
+ml guard      # 看守护状态
+```
+
+不想装就在安装时加个开关：
+
+```bash
+ML_NO_GUARD=1 bash install.sh
+```
+
+> 早先的版本要照着文档手动写这份 service，装完忘了装就等于没有守护 —— 所以改成一起装了。
+> 卸载（`ml uninstall`）会自动停掉并删掉它。
+
+万一你要手工装（比如单独更新这个脚本）：
 ```bash
 cp vpngate9_guard.py /opt/michaelvpn/vpngate9_guard.py
-cat > /etc/systemd/system/vpngate9-guard.service << 'EOF'
-[Unit]
-Description=vpngate9 channel guard (auto-reconnect / rotate)
-After=network.target michaelvpn.service
-Requires=michaelvpn.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /opt/michaelvpn/vpngate9_guard.py
-Restart=always
-RestartSec=10
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now vpngate9-guard
+systemctl restart vpngate9-guard
 ```
 
 ### 行为说明
@@ -394,7 +463,10 @@ systemctl enable --now vpngate9-guard
   端口基准值原来在面板和守护脚本里各写了一份，面板一改，守护就会去连一个没人监听的端口，
   把好端端的通道判成"假连接"然后乱换节点。通道数同理，一律以面板 `/api/status` 为准
 - 同一通道两次重连之间有 `RECONNECT_COOLDOWN` 冷却，避免反复抖动
-- 日志：`journalctl -u vpngate9-guard -f`
+- **面板地址自动适配 http / https**：面板默认开了 HTTPS，守护探活会在
+  `https://127.0.0.1:8787` 与 `http://127.0.0.1:8787` 之间自己试（回环地址不校验证书链，自签也能连）。
+  写死地址就用 `PANEL` 环境变量
+- 日志：`journalctl -u vpngate9-guard -f`（或 `ml guardlogs`）
 
 ### 可调参数（脚本顶部 / 环境变量）
 
@@ -405,7 +477,7 @@ systemctl enable --now vpngate9-guard
 | `FAIL_TOLERANCE` | 2 | 连续 N 轮测不到流量才判定假连接 |
 | `RECONNECT_COOLDOWN` | 120 | 同通道两次重连最小间隔（秒） |
 | `HANDLE_DISCONNECTED` | False | 是否连"掉线"也由本脚本重连 |
-| `PANEL` | `http://127.0.0.1:8787` | 面板地址（环境变量） |
+| `PANEL` | 自动探测 | 面板地址。留空时自动在 `https://127.0.0.1:8787` 和 `http://127.0.0.1:8787` 之间试 |
 | `GUARD_TOKEN_FILE` | `/opt/michaelvpn/vpngate_data/guard_token` | 守护令牌（环境变量 `VPNGATE_GUARD_TOKEN_FILE`） |
 | `AUTH_FILE` | `/opt/michaelvpn/vpngate_data/ui_auth.json` | 兜底凭据文件（环境变量 `VPNGATE_UI_AUTH`） |
 

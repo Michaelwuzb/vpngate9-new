@@ -600,12 +600,151 @@ VPNGate 的 `<ca>` 是内联在配置里的，校验走节点自带证书，不�
 
 ## 十四、还没动的地方（你可以决定要不要）
 
-- 面板仍是 HTTP 明文传输（密码本身已改为 PBKDF2 哈希存储）；需要的话可以加 HTTPS 自签证书或 Caddy 反代。
+> 这一节里原本列的两条已经做掉了：**面板 HTTPS**（见第十五章 15.1）和
+> **install.sh 自动装守护服务**（见 15.3）。下面只留还没动的。
+
 - `openvpn_cmd()` 里没显式设 `--tun-mtu`，靠节点配置自带值，目前实测没问题。
-- `install.sh` 没有自动安装守护 service（README 是手动步骤），要的话我可以补成 `install.sh` 里自动装。
 - 测速默认打 Cloudflare 的 `__down` 端点。如果你不想让面板主动往公网发 10MB 流量，
   可以调小 `SPEEDTEST_BYTES`，或把 `SPEEDTEST_URL` 指向自建测速服务器。
 - 「测带宽」目前是**串行**的（一次借一条通道），9 条空闲通道时不会并行跑 9 个节点。
   想更快可以改成多通道并行，代价是会同时占用多条通道。
 - 新节点标记只按"首次出现时间"判定，没有区分"这次出现的是不是上个月来过的老节点"。
   超过 `SEEN_KEEP_DAYS`(30天) 后会遗忘并重新算新 —— 这个行为我认为是合理的，但你要改成永久记忆也很容易。
+
+---
+
+## 十五、本轮：面板 HTTPS + IP 类型补"未知" + 守护自动安装（15:38 起）
+
+这轮的原则是**越轻量越好**：不引入任何第三方依赖、不加常驻开销、不加额外网络请求。
+下面三项都按这个尺子做的。
+
+### 15.1 面板 HTTPS：优先复用现成证书，没有才自签
+
+新增 `ui_tls.py`（约 400 行，纯标准库 + `openssl` 命令行）。
+
+**为什么是"先找现成的"而不是"自带一份自签"**：这台机器上大概率已经有一个域名和一份
+受信任的证书（s-ui / acme.sh / Let's Encrypt / 宝塔签发的）。再自签一份纯属添乱——
+浏览器要多点一次信任，还得单独维护续期。所以顺序是：
+
+1. `ui_tls.json` / 环境变量里**显式指定**的 cert/key
+2. **自动扫描**（按优先级）：
+   - `/usr/local/s-ui/cert/` ← s-ui 默认位置（面板里用 acme.sh 签发的证书就在这），
+     Docker 部署是 `/etc/s-ui/cert/`
+   - `/root/.acme.sh/<域名>[_ecc]/`
+   - `/etc/letsencrypt/live/<域名>/`
+   - `/www/server/panel/vhost/cert/<域名>/`（宝塔）
+   - Xray / sing-box / v2ray-agent / `/root/cert/`
+3. 都没有 → `openssl` 自签一份，落在 `vpngate_data/ui_cert/`
+
+三种目录布局都能配对，因为各家放法不一样：
+固定名（`fullchain.pem` + `privkey.pem`）、同名（`example.com.pem` + `example.com.key`）、
+acme.sh 的目录名即域名（`<域名>_ecc/fullchain.cer` + `<域名>.key`）。
+
+**几个刻意做的判断**：
+
+| 决定 | 为什么 |
+|---|---|
+| 用 `openssl` 命令行自签，不引入 `cryptography` | 标准库不能签发证书。为了自签拉一个第三方库进来，和"轻量"直接冲突。openssl 几乎每台 Linux 都有，`install.sh` 也显式装了 |
+| 只读别人的证书，绝不改写 | `/usr/local/s-ui/cert/` 是 s-ui 的东西，我们借来用，不去动它。自签产物只写自己目录 |
+| 过期 / 公私钥不匹配的证书**在启动时就跳过** | 这类证书会让浏览器硬失败，但在 TLS 握手时才暴露。不如启动时就判掉并继续找下一个源 |
+| `.key` / `chain.pem` / CA bundle 不当叶子证书 | 目录里啥都有，扫到私钥或中间链拿去当证书用是个很隐蔽的坑 |
+| 自签有效期设 **825 天** | 不是随便定的：Apple 从 2019 起对 TLS 叶子证书（含自签）强制 ≤825 天，写 3650 在 Safari/iOS 上直接被拒 |
+| 默认就是 HTTPS（`auto`） | 与其因为找不到证书就无声退回明文，不如上一份自签——浏览器多点一次"继续"，但流量是加密的。真不想要：`VPNGATE_UI_TLS=off` |
+| 证书放进 SAN，含本机 IP | 现代浏览器不接受没有 SAN 的证书。IP 探测走 UDP `connect()`（内核选源地址，**不发包**），不引入网络请求 |
+| 临期（<30 天）自动重签 | 只在启动时判定；运行中快过期会在日志里提醒（结果缓存 1 小时，不会每轮都去解析证书） |
+| 任何一步失败都退回 HTTP | 证书问题绝不能让面板起不来。启动顺序是"先 bind 成功 → 再 wrap → wrap 失败就退回明文" |
+
+**改到的文件**：`ui_tls.py`（新）、`vpngate9_multi.py`（启动时 setup + wrap_socket，
+`/api/status` 多返回 `ui_scheme` / `ui_tls_source` / `ui_cert_self_signed` / `ui_cert_days`，
+`--set-credentials` 顺带把面板地址按实际协议打出来）、`vpngate9_guard.py`、`install.sh`。
+
+### 15.2 守护脚本跟上协议切换
+
+面板默认开了 HTTPS，而守护探活原来写死 `http://127.0.0.1:8787` —— 那不是 401，
+是连接层直接失败。后果很严重：守护会把"面板无响应"当成常态，**9 条通道的巡检全部停摆**。
+
+- 候选地址 `["https://127.0.0.1:8787", "http://127.0.0.1:8787"]`，先试 https，连不上自动换
+- 回环地址用 `ssl._create_unverified_context()`，不校验证书链（自签证书的域名本来就对不上 `127.0.0.1`，
+  而回环地址不存在中间人问题）
+- 显式设了 `PANEL` 环境变量就不猜
+- 顺手修了个小误导：原来"连接层失败"和"密码不对"都打同一句"登录面板失败(账号或密码不对?)"，
+  会把人往改密码的方向带，现在分开了
+
+### 15.3 install.sh 自动装守护 + 认协议的 ml
+
+- 新增 `install_guard_service()`：写 `vpngate9-guard.service`、`enable`、启动。
+  `After=` 里带上 `michaelvpn.service`（排在被守护的面板之后），`Restart=always` +
+  `StartLimitIntervalSec=0`（崩了无限重启）。不想装：`ML_NO_GUARD=1`
+- 以前要照着 README 手动写这份 service，**装完忘了装就等于没有守护**——所以改成一起装了
+- 卸载（`ml uninstall`）会停掉并删除守护服务；`ml` 新增 `guard` / `guardlogs`；
+  `start` / `stop` / `restart` / `passwd` 都带上守护
+- `ml status` 改用 `panel_api()`：先 `curl -sk https://localhost:8787/...`，失败再退 http。
+  状态第一行直接显示**面板跑在哪个协议 + 证书来源**
+- 安装完的提示不再写死 `http://`：启动后问一次面板自己的 `/api/status`，按它报的
+  `ui_scheme` 输出地址，并说明证书是哪来的、自签要点"继续访问"
+
+### 15.4 IP 类型补「未知」+ 置信度（纯本地推断）
+
+**旧行为**：机构名和 PTR 都没有特征时，一律兜底成 `residential`。
+**后果**：面板上"住宅"里混着一批其实毫无依据的节点——数字好看，但不可信。
+
+**现在**：这种一律 `unknown` + `low` 置信度，判定依据里带出 ISP / PTR 原文让人自己看。
+
+置信度分档（全部基于已经抓到的数据，**不新增任何网络请求**）：
+
+| 证据 | 类型 | 置信度 |
+|---|---|---|
+| 机构名（ISP/组织/AS 名）命中关键词 | mobile / hosting / residential | 高 |
+| PTR 反查域名命中特征 | residential / hosting | 中 |
+| ip-api 的 hosting / mobile 标记兜底 | hosting / mobile | 中 |
+| 以上都没有 | **unknown** | 低 |
+
+**注意这是预期内的行为变化**：面板里"未知"的数量会增加，"住宅"的数量会下降。
+`unknown` 只是"没判出来"，**不影响节点可用性，也不影响不指定类型时的自动分配**。
+
+同步改的地方：
+- `vpn_utils.py`：`classify_ip_type` 返回四元组（多了 confidence），`_CLS_VER` 4 → 5
+  （旧缓存自动失效重查），缓存条目加 `ip_confidence`
+- `vpngate9_multi.py`：`IP_TYPE_KEYS` / `IP_TYPE_LABELS` / `ip_type_label()`；
+  `country_supply()` 原来用**字典查表**取类型，传 `unknown` 会 KeyError → 改成集合判断，
+  统计里多一档 `unknown`
+- 前端：节点表、通道卡片、两个筛选下拉都支持"未知"；顺手修掉一个旧问题——
+  **通道卡片原来把 `residential` / `hosting` 这种英文值直接显示在页面上**，
+  现在统一走 `ipTypeLabel()`；节点筛选的下拉原来也没有"移动"这一项，补上了
+
+### 15.5 把"漏改一个文件"这类假故障堵掉
+
+六个测试脚本原来都把源码文件名**硬编码**在一个 tuple 里（`("vpngate9_multi.py", "vpn_utils.py", ...)`），
+都复制到临时目录再 import。这次新增 `ui_tls.py` 就撞上了：六个脚本全部
+`ModuleNotFoundError: No module named 'ui_tls'` 崩掉——**看起来像代码坏了，其实是测试的清单过期**。
+
+改成自动收集：`_SRC_MODULES = sorted(n for n in os.listdir(FIX) if n.endswith('.py'))`。
+以后再加模块不用回来改测试。
+
+同类问题还修了两处：
+- `vg9_assign_http_test.py` 里 `st` 在循环一次都没成功时没有被赋值，后面断言取 `st.get()`
+  会以 `NameError` 收场，**把真实失败原因（节点池空）整个盖掉**。补了 `st = {}`
+- 这两个 HTTP 接口测试是起真实进程走**明文** HTTP 的，面板默认开 HTTPS 后必然连不上。
+  给它们显式加 `VPNGATE_UI_TLS=off`：接口测试就老老实实测接口，TLS 由新测试专门覆盖
+
+### 15.6 验证
+
+新增 `tests/vg9_https_test.py` **63 项**，分八段：
+
+| 段 | 覆盖 |
+|---|---|
+| A | 证书发现：s-ui / 同名 / acme.sh 三种布局、过期跳过、公私钥不匹配跳过、私钥与中间链不被误当证书、显式指定优先 |
+| B | 自签：带 SAN、有效期 ≤825 天、私钥 600、有效期内沿用、临期自动重签、**无第三方依赖** |
+| C | 真起一个 HTTPS 服务，客户端完成握手；TLS1.1 及以下握不上 |
+| D | 主程序集成：先 bind 再 wrap、wrap 失败退回明文、状态接口字段、默认 HTTPS / 显式 off 才明文 |
+| E | 守护协议自适应：https 面板能连、只有 http 会自动切、面板不在返回 None 且不卡住、显式 PANEL 不猜 |
+| F | 分类：四类兜底路径 + 置信度分档 + 判定依据带原文 + 版本号 + unknown 可筛可统计 |
+| G | 安装脚本：守护单元内容（After= 只一行、无限重启）、ml 认 https、内嵌脚本语法 |
+| H | **端到端**：起真实面板进程 → TLS 握手 → 登录 → 拿到面板页 → `/api/status` 报 `ui_scheme=https` → 同端口不接受明文 |
+
+证书数据全部用 `openssl` 现场生成。造"已过期证书"用的 `-not_before/-not_after` 是
+OpenSSL 3.4+ 才有的参数，老版本上会失败——所以那两条用例造不出来就打印 `[SKIP]` 跳过，
+不让测试假失败。
+
+回归：43（稳定性）+ 36（分配逻辑）+ 44（分配接口）+ 37（新节点/测速）+ 40（前端单测）
++ 61（端到端）+ 前端校验，**全部通过**。

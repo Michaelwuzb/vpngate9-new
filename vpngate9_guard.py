@@ -10,12 +10,17 @@
 #   2) 可选: 定时主动轮换出口 IP (ROTATE_EVERY)
 #   3) 每个通道沿用它在面板里设置的国家 / IP 类型; 面板没设置就交给服务端自动挑
 #   4) 连续 N 轮拿不到流量才动手, 避免网络抖动误判
-# 部署: cp vpngate9_guard.py /opt/michaelvpn/ && systemctl restart vpngate9-guard
+# 部署: install.sh 会自动装成 vpngate9-guard.service（装完即用, 不用手动配）
+#       手动: cp vpngate9_guard.py /opt/michaelvpn/ && systemctl restart vpngate9-guard
+# 面板地址: 面板默认已启用 HTTPS（复用机器上现成的证书, 没有就自签）,
+#       本脚本会自动在 https / http 之间探测; 回环地址不校验证书链。
+#       要写死地址就用 PANEL 环境变量, 例如 PANEL=https://127.0.0.1:8787
 
 from __future__ import annotations
 
 import json
 import os
+import ssl
 import subprocess
 import sys
 import time
@@ -23,7 +28,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-PANEL = os.environ.get("PANEL", "http://127.0.0.1:8787")
+PANEL = os.environ.get("PANEL", "").strip()
+# 面板现在默认开 HTTPS（复用机器上的证书，没有就自签）。守护跑在同一台机器上，
+# 127.0.0.1 上自签证书的域名对不上是常态，所以不校验证书链——反正是回环地址,
+# 不存在中间人的问题。用 PANEL 环境变量显式指定地址时则不做自动探测。
+_SSL_CTX = ssl._create_unverified_context()
+PANEL_CANDIDATES = [PANEL] if PANEL else ["https://127.0.0.1:8787",
+                                          "http://127.0.0.1:8787"]
+_panel_idx = 0
 AUTH_FILE = os.environ.get("VPNGATE_UI_AUTH", "/opt/michaelvpn/vpngate_data/ui_auth.json")
 GUARD_TOKEN_FILE = os.environ.get("VPNGATE_GUARD_TOKEN_FILE", "/opt/michaelvpn/vpngate_data/guard_token")
 NUM_CHANNELS = 9            # 已废弃：通道数一律以面板 /api/status 为准（保留仅为兼容旧文档）
@@ -76,6 +88,24 @@ def _load_credentials() -> tuple[str, str]:
 USER, PASS = _load_credentials()
 
 
+def _active_panel() -> str:
+    return PANEL_CANDIDATES[_panel_idx]
+
+
+def _switch_panel() -> bool:
+    """http/https 猜错了就换一个再试。显式指定 PANEL 时不猜。
+
+    面板加了 HTTPS 之后, 探活还用 http 会直接连不上(不是 401, 是连接层报错),
+    那样守护会把所有通道都当成"面板无响应"而彻底停摆。
+    """
+    global _panel_idx
+    if len(PANEL_CANDIDATES) < 2:
+        return False
+    _panel_idx = (_panel_idx + 1) % len(PANEL_CANDIDATES)
+    warn_once("面板地址改用 %s" % _active_panel())
+    return True
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None  # 登录返回 302, 不跟随, 直接从响应头取 token
@@ -90,54 +120,69 @@ def _parse_cookie(resp) -> None:
                     cookie = part.strip()
 
 
-def login() -> None:
+def login() -> bool:
+    """返回 True 表示拿到了会话(或至少"面板答话了")。"""
     global cookie, USER, PASS
+    reached = True
     tok = _load_guard_token()
     if tok:
         cookie = "token=" + tok
-        return
+        return True
     # 每次都重读磁盘: 面板改账号/密码后能自动跟上, 也兼容令牌文件后生成的情况
     USER, PASS = _load_credentials()
     if not PASS:
         warn_once("未找到守护令牌 %s，且 %s 里没有可用的密码；"
                   "请确认新版面板已启动过（它会自动生成令牌），或用 VPNGATE_USER/VPNGATE_PASS 指定"
                   % (GUARD_TOKEN_FILE, AUTH_FILE))
-        return
+        return False
     data = urllib.parse.urlencode({"username": USER, "password": PASS}).encode()
-    req = urllib.request.Request(PANEL + "/api/login", data=data,
+    req = urllib.request.Request(_active_panel() + "/api/login", data=data,
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        opener = urllib.request.build_opener(NoRedirect)
+        opener = urllib.request.build_opener(
+            NoRedirect, urllib.request.HTTPSHandler(context=_SSL_CTX))
         _parse_cookie(opener.open(req, timeout=10))
     except urllib.error.HTTPError as e:
         _parse_cookie(e)
     except Exception:
-        pass
-    if not cookie:
+        # 连接层失败(协议不对 / 面板没起)和"密码不对"要分开说,
+        # 否则日志会把人往改密码的方向带。
+        reached = False
+    if not cookie and reached:
         warn_once("登录面板失败(账号或密码不对?): %s" % AUTH_FILE)
+    return reached
 
 
 def api(path, data=None, method="GET"):
     global cookie
-    if not cookie:
-        login()
-        if not cookie:
+    for attempt in (0, 1):
+        if not cookie and not login():
+            if attempt == 0 and _switch_panel():
+                continue
             return None
-    headers = {"Cookie": cookie}
-    if data is not None:
-        data = urllib.parse.urlencode(data).encode()
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    req = urllib.request.Request(PANEL + path, data=data, headers=headers, method=method)
-    try:
-        return json.loads(urllib.request.urlopen(req, timeout=20).read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            cookie = ""   # token 失效, 下一轮重新登录
-            warn_once("面板返回 %d: 守护令牌或账号密码无效; 若刚改过面板密码, "
-                      "请确认 %s 存在且与面板 vpngate_data/guard_token 一致" % (e.code, GUARD_TOKEN_FILE))
-        return None
-    except Exception:
-        return None
+        headers = {"Cookie": cookie}
+        body = data
+        if body is not None:
+            body = urllib.parse.urlencode(body).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(_active_panel() + path, data=body,
+                                     headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                cookie = ""   # token 失效, 下一轮重新登录
+                warn_once("面板返回 %d: 守护令牌或账号密码无效; 若刚改过面板密码, "
+                          "请确认 %s 存在且与面板 vpngate_data/guard_token 一致"
+                          % (e.code, GUARD_TOKEN_FILE))
+            return None
+        except Exception:
+            cookie = ""
+            if attempt == 0 and _switch_panel():
+                continue
+            return None
+    return None
 
 
 def test_socks(port: int):
@@ -166,8 +211,8 @@ def reconnect(idx: int, country: str, ip_type: str, node_id=None):
 def main() -> None:
     global cookie   # 面板无响应时要真的把会话清掉(否则下一轮 api() 不会重新登录)
     tok_mode = bool(_load_guard_token())
-    print("vpngate9 guard start: every %ds, handle_disconnected=%s, auth=%s"
-          % (CHECK_EVERY, HANDLE_DISCONNECTED,
+    print("vpngate9 guard start: panel=%s, every %ds, handle_disconnected=%s, auth=%s"
+          % (_active_panel(), CHECK_EVERY, HANDLE_DISCONNECTED,
              "guard_token" if tok_mode else "account/password"), flush=True)
     if not tok_mode:
         warn_once("未使用守护令牌, 改用账号密码登录; 面板改密后需同步 %s, "
