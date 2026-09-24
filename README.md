@@ -8,7 +8,7 @@
 ## 🚀 一键安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9-new/main/install.sh)
 ```
 
 安装后访问 `http://<VPS_IP>:8787/` 进入管理面板。
@@ -17,7 +17,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9/main/inst
 ## 🗑️ 一键卸载
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9/main/install.sh) uninstall
+bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9-new/main/install.sh) uninstall
 ```
 
 卸载所有文件和服务。
@@ -273,6 +273,8 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 ├── speedtest_utils.py     # 测速（SOCKS5 + HTTP 下载，纯标准库）
 ├── vpngate9_guard.py      # 通道守护脚本（可选）
 ├── install.sh             # 部署脚本
+├── tests/                 # 测试脚本（逻辑 / 前端 / 端到端，用法见 tests/README.md）
+├── docs/                  # 修改说明、代码检查报告
 ├── vpngate_data/
 │   ├── login.html         # 登录页面
 │   ├── ui_auth.json       # 管理账号 + 密码哈希（chmod 600）
