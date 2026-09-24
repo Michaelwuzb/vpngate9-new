@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
 from __future__ import annotations
 import base64
 import os
@@ -393,12 +398,18 @@ def proxy_client(client: socket.socket, address: tuple[str, int], tun_dev: str =
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int, tun_dev: str = "tun0") -> None:
+def create_proxy_listener(host: str, port: int) -> socket.socket:
+    """建好并 listen 一个代理监听套接字；失败直接抛异常。
+
+    单独剥出来，是为了让主程序能在**主线程**里按顺序把 9 个端口建起来。
+    原实现是每通道一个子线程各自 bind，失败只在子线程里 print 一行就 return，
+    主进程完全不知情 —— 结果就是面板显示"9 个通道全部已连接"，
+    实际却有几个代理根本不在监听。
+    """
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    server = None
+    server = socket.socket(af, socket.SOCK_STREAM)
     try:
-        server = socket.socket(af, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if is_ipv6:
             try:
@@ -407,50 +418,34 @@ def start_proxy_server(host: str, port: int, tun_dev: str = "tun0") -> None:
                 pass
         server.bind((host, port))
         server.listen(256)
-        print(f"HTTP/SOCKS5 proxy [{tun_dev}] listening on {host}:{port}", flush=True)
-    except Exception as e:
-        if server is not None:
-            try:
-                server.close()
-            except Exception:
-                pass
-        if is_ipv6 and host in ("::", ""):
-            # 回退只退到 IPv4 回环。原实现回退到 0.0.0.0，会让 9 个 SOCKS5 端口
-            # 在没有认证(proxy_auth 默认关闭)的情况下直接暴露到公网。
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
-            try:
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("127.0.0.1", port))
-                server.listen(256)
-                print(f"HTTP/SOCKS5 proxy [{tun_dev}] listening on 127.0.0.1:{port} (仅 IPv4)", flush=True)
-            except Exception as ex:
-                import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
-                diag_msg = diag[1] if diag else str(ex)
-                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 0.0.0.0:{port}: {diag_msg}", flush=True)
-                return
-        elif is_ipv6 and host == "::1":
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
-            try:
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("127.0.0.1", port))
-                server.listen(256)
-                print(f"HTTP/SOCKS5 proxy [{tun_dev}] listening on 127.0.0.1:{port} (仅 IPv4)", flush=True)
-            except Exception as ex:
-                import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
-                diag_msg = diag[1] if diag else str(ex)
-                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 127.0.0.1:{port}: {diag_msg}", flush=True)
-                return
-        else:
-            import vpn_utils
-            diag = vpn_utils.diagnose_local_obstructions(port, host=host)
-            diag_msg = diag[1] if diag else str(e)
-            print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag_msg}", flush=True)
-            return
+        return server
+    except Exception:
+        try:
+            server.close()
+        except Exception:
+            pass
+        raise
 
+def _proxy_fallback_listener(host: str, port: int, err: Exception) -> socket.socket | None:
+    """IPv6 绑定失败时退到 IPv4 回环；彻底失败则打印诊断并返回 None。"""
+    import vpn_utils
+    if ":" not in host and host != "":
+        diag = vpn_utils.diagnose_local_obstructions(port, host=host)
+        print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag[1] if diag else err}", flush=True)
+        return None
+    # 回退只退到 IPv4 回环。原实现回退到 0.0.0.0，会让 9 个 SOCKS5 端口
+    # 在没有认证(proxy_auth 默认关闭)的情况下直接暴露到公网。
+    print(f"[警告] 绑定 {host}:{port} 失败 ({err})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
+    try:
+        return create_proxy_listener("127.0.0.1", port)
+    except Exception as ex:
+        diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
+        print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 127.0.0.1:{port}: {diag[1] if diag else ex}", flush=True)
+        return None
+
+def serve_proxy(server: socket.socket, host: str, port: int, tun_dev: str = "tun0") -> None:
+    """在已 listen 的套接字上跑 accept 循环（阻塞，通常放子线程里）。"""
+    print(f"HTTP/SOCKS5 proxy [{tun_dev}] listening on {host}:{port}", flush=True)
     while True:
         try:
             client, address = server.accept()
@@ -472,3 +467,19 @@ def start_proxy_server(host: str, port: int, tun_dev: str = "tun0") -> None:
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)
+
+
+def start_proxy_server(host: str, port: int, tun_dev: str = "tun0") -> None:
+    """兼容旧入口：自己建 listener 再服务（阻塞调用，通常放子线程里）。
+
+    主程序现在用 create_proxy_listener + serve_proxy，好处是绑定失败能在主线程里
+    被捕获并回报给面板；这个入口留给手工调用和旧脚本。
+    """
+    try:
+        server = create_proxy_listener(host, port)
+    except Exception as e:
+        server = _proxy_fallback_listener(host, port, e)
+        if server is None:
+            return
+        host = "127.0.0.1"
+    serve_proxy(server, host, port, tun_dev)

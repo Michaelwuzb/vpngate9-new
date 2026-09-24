@@ -1,10 +1,13 @@
-# vpngate9 修改说明（稳定性 + IP 类型误判修复 + 面板改账号密码 + 多出口分配 + 新节点标记 + 测速）
+# vpngate9 修改说明（稳定性 + IP 类型误判修复 + 面板改账号密码 + 多出口分配 + 新节点标记 + 测速 + 多通道稳定性修复）
 
-修改后的完整源码在 `vpngate9_fixed/`，改动差异在 `vpngate9_fix.patch`（2637 行，可用 `git apply` 或直接看）。
+修改后的完整源码在 `vpngate9_fixed/`，改动差异在 `vpngate9_fix.patch`（可用 `git apply`，也可以直接对着看）。
 
-> 本次（第三轮）新增：**一键分配出口支持「全部通道用同一个国家/地区」**（第四节的第三种方式）——
-> 9 条通道全走日本/韩国，出口 IP 依然互不相同。第二轮新增的是**在面板里修改管理账号和密码**（第三节），
-> 并顺带把密码改成哈希存储、加登录限速、加退出登录、给守护脚本改用长效令牌。
+> **轮次导航**
+> - 第一轮：IP 类型误判根因 + 稳定性加固（第一、二节）
+> - 第二轮：面板内修改账号密码、密码改哈希存储、登录限速、退出登录（第三节）
+> - 第三轮：多出口分配三种模式（第四节）
+> - 第四轮：刷新出来的新节点做标记 + 节点测速（第九、十节）
+> - 第五轮：**9 通道架构下的稳定性与可用性修复**、节点源多级回退、GPL-3.0 许可补齐（第十二节）
 
 ---
 
@@ -443,7 +446,159 @@ ssh root@<VPS_IP> 'systemctl restart michaelvpn && systemctl restart vpngate9-gu
 
 ---
 
-## 十二、还没动的地方（你可以决定要不要）
+## 十二、本轮：多通道稳定性与可用性修复（架构保持 9 通道不变）
+
+这一轮没动架构，专门处理「9 条通道并行」才会暴露出来的问题，外加把节点源的可靠性补上。
+每一项都写了「原来的行为 → 现在的行为」和改动位置，方便你对着代码核。
+
+### 12.1 启动不再误杀别人的 openvpn
+
+**原来**：`main()` 里一句裸的 `pkill -f openvpn`（`vpngate9_multi.py:2466`），
+无条件杀掉系统上**所有**匹配的 openvpn 进程。这台 VPS 上如果还跑着别的 openvpn
+（另一个出口、或者你正在手工调试的隧道），会被一起干掉，而且不留任何日志。
+
+**现在**：`cleanup_stale_openvpn()` —— 扫 `/proc/*/cmdline`，
+只挑「命令行里出现本程序配置目录路径」的进程（我们自己的 openvpn 命令行必然带
+`/opt/michaelvpn/vpngate_data/configs/chN.ovpn`），SIGTERM 后仍不退出的再 SIGKILL。
+非 Linux 环境（没有 `/proc`）直接安全返回。
+
+> 顺带一提：我们本来就有 `ch.process` 引用和 `stop_process()`，9 条通道逐个停就够了，
+> 那句 pkill 属于多余且有害。
+
+### 12.2 卸载时清理策略路由
+
+**原来**：9 条通道运行时会往 `table 100~108` 写 `ip rule` / `ip route`，
+但 `install.sh` 的卸载只做了 `stop / disable / rm -rf / 删 sysctl`，**这些规则一条都不清**。
+`tunN` 设备会随进程消失，规则却留在内核里，继续把匹配到的流量往一个不存在的设备上引。
+
+**现在**：
+- `install.sh` 顶部卸载分支和 `/usr/bin/ml` 的卸载分支都加了清理（`seq 200 208`）
+- `cleanup_policy_routing()` 里的 `ip rule del table N` 改成了**循环**：
+  这条命令每次只删一条匹配项，多条时会静默留下残余（原来只调一次，删不干净）
+
+### 12.3 策略路由表号：100 段 → 200 段
+
+4 处硬编码的 `100 + ch.index` 收敛成 `policy_table(index)`，基准值
+`POLICY_TABLE_BASE` 默认 **200**（可用环境变量 `VPNGATE_POLICY_TABLE_BASE` 覆盖）。
+
+100~108 是各类网络管理工具（VPN、防火墙、容器网络）惯用的区间，撞上会出现
+"我们的规则被别人的清理脚本删掉"或"我们覆盖别人的规则"。
+200~252 是内核明确留给本地自定义用途的，系统不会自动占。
+
+> **升级注意**：从旧版本升上来的机器，旧的 `table 100~108` 规则需要手动清一次
+> （命令在 README 的「稳定性机制」一节）。全新部署不需要。
+
+### 12.4 启动端口预检 + 代理绑定失败上报
+
+**原来**：要占 10 个端口（面板 8787 + 代理 47928~47936）。每个通道在**各自的子线程**里
+`bind`，失败只在自己线程里 print 一行就 `return`，主进程完全不知情 ——
+面板照样显示"已连接"。9 通道下最坏的情况是**"9 个通道全显示已连接、实际只有 6 个代理在听"**，
+而且从任何界面都看不出来。
+
+**现在**：
+- `proxy_server_multi.py` 拆出 `create_proxy_listener()` / `serve_proxy()`：
+  监听套接字在**主线程**里按顺序建好，再交给子线程跑 accept 循环，绑定失败当场能捕获
+- `start_all_proxies()` 返回 `{通道号: 失败原因}`，写进 `ch.proxy_error`
+- `preflight_ports()` 启动前把 10 个端口探一遍，结果直接进启动日志：
+  `[init] 端口预检: 代理端口 47930 不可用: Address already in use`
+- 卡片上会出现红色的「代理 :端口 未监听」，`/api/status` 也带 `proxy_error`
+- 代理端口没监听的通道**不会**被判定为已连接
+
+### 12.5 连接就绪判定：三件事都过才算"已连接"
+
+**原来**：只 `probe_tunnel()` 验隧道通不通就置 `state="connected"`，
+而且 `setup_policy_routing()` 是在标记**之后**才调用的（`:783` 标记 / `:788` 建路由）。
+中间那段时间里，走代理的流量会因为 `oif` 规则还没落地而从物理网卡直接出去 ——
+**面板显示的出口 IP 和实际出口不一致**。另外完全没验证 SOCKS 代理进程是否起来了。
+
+**现在**（`connect_channel()` 尾部）：
+1. `setup_policy_routing()` 建路由
+2. `policy_routing_ok()` **回读内核**确认 `ip rule` / `ip route` 真的落地了
+3. `proxy_port_ready()` 实测 127.0.0.1 上的代理端口能连上
+4. 全过才置 `connected`；任何一项不过就 `stop_process` + 清路由 + 状态置 `error` 并写明原因
+
+新增两个函数：`policy_routing_ok()`（解析 `ip rule show` / `ip route show table N`）
+和 `proxy_port_ready()`（TCP 连接实测）。`setup_policy_routing()` 也改成返回布尔值。
+
+### 12.6 节点源多级回退 + 本地快照
+
+**原来**：只有 `https://www.vpngate.net/api/iphone/` 一个源，没有任何回退。
+9 条通道共用这一个节点池，源被墙/抽风就是**整池拉不到 → 9 条通道全没节点可用**，
+重启后连缓存都没有（`nodes.json` 是给面板看的，刻意剥离了 `config_text`，回来也建不了隧道）。
+
+**现在**：`fetch_nodes()` 按序尝试
+**官方 HTTPS → 官方 HTTP → 本地快照**（`vpngate_data/nodes_snapshot.json`）。
+
+- 每次成功拉取都会把**完整**节点（含 `config_text`）落一份快照
+- 走到快照时 `_last_fetch_source = "snapshot"`，会出现在日志、面板状态栏
+  （「· 用的是本地快照」）和 `POST /api/fetch_nodes` 的响应里
+- 快照缺失/损坏/没有可用节点时正常返回空，不抛异常
+- 解析部分拆成 `_parse_vpngate_csv()`，拿到响应但解析不出节点时会**继续试下一个源**
+
+### 12.7 守护脚本解耦：端口与通道数从面板读
+
+**原来**：`vpngate9_guard.py` 里自己算 `port = PROXY_BASE_PORT + idx`，
+通道数也是写死的 `NUM_CHANNELS = 9`。端口基准值等于在面板和守护里各写了一份常量 ——
+面板一改，守护就会去连一个没人监听的端口，把**正常通道判成"假连接"然后乱换节点**。
+
+**现在**：端口直接用面板 `/api/status` 返回的 `proxy_port`；通道数在首轮从面板读出来打印。
+`PROXY_BASE_PORT` 只作为"面板是老版本、不返回 proxy_port"时的兜底。
+
+### 12.8 openvpn 加防中间人校验
+
+`openvpn_cmd()` 增加 `--remote-cert-tls server`（要求节点证书 `keyUsage` 带 `serverAuth`）。
+VPNGate 的 `<ca>` 是内联在配置里的，校验走节点自带证书，不需要额外 CA 文件。
+
+个别节点证书不合规会因此连不上，设 `VPNGATE_STRICT_TLS=0` 即可关掉。
+
+### 12.9 补齐 GPL-3.0 许可证与来源声明
+
+上游 `aimili-vpngate` 以 GPL-3.0 发布，本仓库是衍生作品，公开分发需要随附许可证并保留来源。
+但上游仓库里的 `LICENSE` **只放了标题、序言和免责声明，正文是占位符**
+（第 12 行是 `...`，第 13 行写着"完整文本请从网上获取"），本身就不满足 GPL-3.0 第 4 条。
+
+**现在**：
+- `LICENSE` 换成 FSF 发布的完整 GPL-3.0 文本（674 行）
+- 新增 `NOTICE`：写清衍生关系、上游地址、本仓库的改造清单
+- 六个源码文件头部加上来源与许可声明
+
+### 12.10 安装脚本默认仓库名修正
+
+`install.sh` 里 `REPO_NAME` 默认值是 `vpngate9`，但 README 的一键安装命令是从
+`vpngate9-new` 下载脚本的 —— 结果是"从新仓库下脚本、去克隆旧仓库的代码"。
+已改为默认 `vpngate9-new`（仍可用 `bash install.sh <owner> <repo>` 覆盖）。
+
+---
+
+## 十三、本轮的验证
+
+| 测试 | 覆盖 | 结果 |
+|---|---|---|
+| `vg9_stability_test.py`（本轮新增） | 端口预检 / 代理失败上报 / 节点源三级回退 / 快照落盘 / 路由循环清理与回读 / 连接就绪顺序 / 进程清理 / openvpn 参数 / 安装脚本静态检查 | **43 / 43** |
+| `vg9_seen_speed_test.py`（回归） | 新节点标记 + 测速模块（含 mock SOCKS5 服务端） | **37 / 37** |
+| `vg9_frontend_check.py`（回归） | 内联 JS 语法 + 函数/元素/onclick 引用完整性 | 全部通过 |
+| `vg9_frontend_test.js`（回归） | 前端 DOM stub 单测 | **40 / 40** |
+| `vg9_assign_test.py`（回归） | 多出口分配逻辑 | **36 / 36** |
+| `vg9_assign_http_test.py`（回归） | 分配接口端到端 | **44 / 44** |
+| `vg9_new_speed_http_test.py`（回归） | 新节点标记 + 测速端到端（真实面板 + mock 节点源） | **61 / 61** |
+
+新测试里几个值得一提的点：
+
+- **就绪顺序是真的验了顺序**：用一个假进程伪造 `Initialization Sequence Completed`，
+  然后在 `setup_policy_routing` / `policy_routing_ok` / `proxy_port_ready` 三个钩子里
+  记录此时的 `ch.state` —— 三个都必须是 `connecting`，证明没有任何一步发生在标记之后
+- **端口占用是真的占**：`bind` + `listen` 一个真实端口再启动代理，验证它进失败清单、
+  其余通道不受影响
+- **路由回读用 mock 输出**：分别喂"表号对 / 表号错 / 没有默认路由 / 拿不到 ip 输出"四种情况
+
+> **环境限制**：本机是 Windows，没有 openvpn 和 `ip` 命令，**真建隧道和真写策略路由没法实测**。
+> 这两块的验证方式是：协议/顺序行为用假进程 + 钩子验证，`ip` 命令交互用 mock 输出验证。
+> 上真机后第一次启动，建议看一眼日志里这两行：
+> `[route tunX] table 20X OK` 和 `[init] 代理端口就绪 9/9`。
+
+---
+
+## 十四、还没动的地方（你可以决定要不要）
 
 - 面板仍是 HTTP 明文传输（密码本身已改为 PBKDF2 哈希存储）；需要的话可以加 HTTPS 自签证书或 Caddy 反代。
 - `openvpn_cmd()` 里没显式设 `--tun-mtu`，靠节点配置自带值，目前实测没问题。

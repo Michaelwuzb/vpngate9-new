@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
 """
 vpngate9_multi.py - 9-Channel VPN Gateway + Node Management UI
 Combines: multi-tunnel + full node table (IP info, filters, assign to channels)
 """
 from __future__ import annotations
-import base64, csv, io, json, os, random, re, shlex, socket, subprocess, sys
+import base64, csv, io, json, os, random, re, shlex, signal, socket, subprocess, sys
 import threading, time, urllib.request, urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -170,10 +175,18 @@ LOGIN_HTML_CACHE = ""
 
 NUM_CHANNELS = 9
 PROXY_BASE_PORT = 47928
+# 策略路由表号：通道 i 用 POLICY_TABLE_BASE + i。
+# 用 200 段而不是原来的 100 段——100~108 常被各类网络管理工具占用（VPN/防火墙/容器
+# 网络），撞上就会出现"规则被别人的清理脚本删掉"或者"我们的规则覆盖别人的"。
+# 200~252 是内核留给本地自定义用途的区间，系统不会自动占。
+POLICY_TABLE_BASE = int(os.environ.get("VPNGATE_POLICY_TABLE_BASE", "200"))
 UI_PORT = 8787
 UI_HOST = "::"
 LOCAL_PROXY_HOST = "127.0.0.1"
 API_URL = "https://www.vpngate.net/api/iphone/"
+# 多级节点源，按顺序尝试。9 条通道共用同一个节点池：只有一个源的话，
+# vpngate.net 被墙或抽风就是 9 条通道一起没节点可用、重启后连缓存都没有。
+API_URLS = [API_URL, "http://www.vpngate.net/api/iphone/"]
 FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", "600"))
 
 # === 稳定性参数 ===
@@ -198,6 +211,7 @@ DATA_DIR = ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 SEEN_FILE = DATA_DIR / "nodes_seen.json"      # 节点首现时间记录（判断"新节点"的基准）
+NODES_SNAPSHOT_FILE = DATA_DIR / "nodes_snapshot.json"   # 上次成功拉取的完整节点（含配置，供源不可用时回退）
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 CHANNELS_FILE = DATA_DIR / "channels.json"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
@@ -255,6 +269,7 @@ class Channel:
         self.speed_ttfb_ms = 0
         self.speed_at = 0.0             # 最近一次测速时间戳
         self.speed_error = ""
+        self.proxy_error = ""           # 本地代理端口没起来时的原因（启动时探测）
         self.lock = threading.Lock()
 
     def to_dict(self) -> dict:
@@ -268,7 +283,7 @@ class Channel:
              "node_latency": self.node_latency, "error": self.error,
              "speed_testing": self.speed_testing, "speed_mbps": self.speed_mbps,
              "speed_ttfb_ms": self.speed_ttfb_ms, "speed_at": self.speed_at,
-             "speed_error": self.speed_error}
+             "speed_error": self.speed_error, "proxy_error": self.proxy_error}
         return d
 
 channels: list[Channel] = [Channel(i) for i in range(NUM_CHANNELS)]
@@ -685,6 +700,75 @@ def stop_process(proc: subprocess.Popen[str] | None):
         try: proc.kill(); proc.wait(timeout=2)
         except: pass
 
+def _our_config_marker() -> str:
+    """识别"本程序启动的 openvpn"的关键字：我们自己的配置目录绝对路径。
+
+    每个通道的配置都落在 CONFIG_DIR/chN.ovpn，openvpn 命令行里必然出现这个路径，
+    所以拿它做匹配只可能命中自己启动的进程。
+    """
+    return str(CONFIG_DIR)
+
+def cleanup_stale_openvpn() -> list[int]:
+    """清理上次运行残留的、**属于本程序**的 openvpn 进程。
+
+    原来的实现是一句裸的 `pkill -f openvpn`，会无条件杀掉系统上所有 openvpn。
+    这台 VPS 上如果还跑着别的 openvpn（另一个出口、或在手工调试的隧道），
+    会被一起干掉，而且不留任何记录——重启服务后才发现别的隧道没了。
+    这里改成扫描 /proc，只认命令行里出现我们自己配置目录的那些进程。
+    """
+    marker = _our_config_marker()
+    me = os.getpid()
+    victims: list[int] = []
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return victims          # 非 Linux 环境直接跳过
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me or pid == os.getppid():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue            # 进程刚好退出，或没权限读，跳过
+        if not raw:
+            continue
+        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+        if "openvpn" not in cmdline or marker not in cmdline:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            victims.append(pid)
+        except OSError:
+            pass
+    if not victims:
+        return victims
+    # 给它们一点时间优雅退出，赖着不走的再强杀，避免下面的建隧道撞 tun 设备
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        alive = [p for p in victims if _pid_alive(p)]
+        if not alive:
+            break
+        time.sleep(0.2)
+    for pid in victims:
+        if _pid_alive(pid):
+            try: os.kill(pid, signal.SIGKILL)
+            except OSError: pass
+    log(f"[init] 清理残留 openvpn 进程 {len(victims)} 个: {victims}")
+    return victims
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
 def release_slot(ch: Channel) -> None:
     """释放出口 IP 预占。
 
@@ -694,13 +778,34 @@ def release_slot(ch: Channel) -> None:
     ch.reserved_ip = ""
     ch.ip_reused = False
 
-def cleanup_policy_routing(table: int):
-    try: subprocess.run(["ip","rule","del","table",str(table)], capture_output=True, timeout=2)
-    except: pass
-    try: subprocess.run(["ip","route","flush","table",str(table)], capture_output=True, timeout=2)
-    except: pass
+def policy_table(index: int) -> int:
+    """通道 index 对应的策略路由表号。
 
-def setup_policy_routing(tun_dev: str, table: int):
+    200~252 是留给本地自定义用途的区间，不像 100 段那样常被各种网络管理工具占用。
+    """
+    return POLICY_TABLE_BASE + index
+
+def _run_ip(args: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(["ip", *args], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None             # 没有 ip 命令（非 Linux）或超时
+
+def cleanup_policy_routing(table: int):
+    """把该策略表删干净。
+
+    `ip rule del table N` 每次只删**一条**匹配项，多条时会静默留下残余，
+    所以必须循环删到删不动为止。原来只调一次，规则残留时会带着旧 tun 设备名
+    留在系统里，继续劫持别的东西的路由决策。
+    """
+    for _ in range(64):        # 上限兜底，永不空转
+        r = _run_ip(["rule", "del", "table", str(table)])
+        if r is None or r.returncode != 0:
+            break
+    _run_ip(["route", "flush", "table", str(table)])
+
+def setup_policy_routing(tun_dev: str, table: int) -> bool:
+    """建策略路由（默认路由 + oif 规则）。返回是否真的建成功。"""
     cleanup_policy_routing(table)
     try:
         subprocess.run(["ip","route","add","default","dev",tun_dev,"table",str(table)], check=True, timeout=2)
@@ -709,7 +814,38 @@ def setup_policy_routing(tun_dev: str, table: int):
             try: subprocess.run(["sysctl","-w",f"net.ipv4.conf.{p}.rp_filter=2"], capture_output=True, timeout=2)
             except: pass
         log(f"[route {tun_dev}] table {table} OK")
-    except Exception as e: log(f"[route {tun_dev}] Failed: {e}")
+        return True
+    except Exception as e:
+        log(f"[route {tun_dev}] Failed: {e}")
+        return False
+
+def policy_routing_ok(tun_dev: str, table: int) -> bool:
+    """回读内核，确认 oif 规则和默认路由都真的落地了。
+
+    不能只看 `ip rule add` 没报错就算完——顺序错位时会出现"面板显示已连接、
+    但流量还是从物理网卡直接出去"（出口 IP 与面板不符），这种问题只能靠回读发现。
+    """
+    r = _run_ip(["rule", "show"])
+    if r is None or f"oif {tun_dev}" not in r.stdout or f"lookup {table}" not in r.stdout:
+        return False
+    r2 = _run_ip(["route", "show", "table", str(table)])
+    if r2 is None:
+        return False
+    return "default" in r2.stdout and tun_dev in r2.stdout
+
+def proxy_port_ready(port: int, tries: int = 3, timeout: float = 1.0) -> bool:
+    """本地 SOCKS 代理端口是否真的在监听。
+
+    隧道通了不等于代理可用：代理进程可能因为端口被占早就静默退出了。
+    """
+    for i in range(max(1, tries)):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                return True
+        except OSError:
+            if i + 1 < tries:
+                time.sleep(0.5)
+    return False
 
 def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
     cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
@@ -721,13 +857,18 @@ def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
            "--auth-user-pass",str(AUTH_FILE),"--auth-nocache","--verb","3",
            "--data-ciphers","AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
            "--route-nopull"]
+    # 防中间人：要求节点证书的 keyUsage 带 serverAuth。VPNGate 的 <ca> 是内联的，
+    # 校验走节点自带证书，不需要额外 CA 文件。
+    # 个别节点证书不合规会因此连不上，遇到时设 VPNGATE_STRICT_TLS=0 关掉。
+    if os.environ.get("VPNGATE_STRICT_TLS", "1") != "0":
+        cmd.extend(["--remote-cert-tls", "server"])
     if Path("/etc/ssl/certs").exists(): cmd.extend(["--capath","/etc/ssl/certs"])
     return cmd
 
 def connect_channel(ch: Channel, node: dict) -> bool:
     with ch.lock:
         stop_process(ch.process); ch.process = None
-        cleanup_policy_routing(100 + ch.index)
+        cleanup_policy_routing(policy_table(ch.index))
         ch.state = "connecting"
         ch.last_connect_at = time.time()
         ch.fail_streak = 0
@@ -778,6 +919,30 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         release_slot(ch)
         return False
 
+    # 策略路由必须**先**建好，再对外宣告已连接。
+    # 原实现是先置 state="connected" 再 setup_policy_routing，中间那几十毫秒里
+    # 走代理的流量会因为 oif 规则还没落地而从物理网卡直接出去（出口 IP 与面板不符）。
+    table = policy_table(ch.index)
+    if not setup_policy_routing(ch.tun, table) or not policy_routing_ok(ch.tun, table):
+        log(f"[CH{ch.index}] 策略路由未生效，放弃本次连接")
+        stop_process(proc)
+        cleanup_policy_routing(table)
+        ch.state = "error"; ch.error = "policy routing not applied"
+        ch.last_node_data = None
+        release_slot(ch)
+        return False
+
+    # 代理端口必须真的在听。隧道通了不代表代理可用：端口被占时代理线程早就静默退出了，
+    # 这种情况下面板会显示"9 个通道全部已连接"、实际却有几个根本用不了。
+    if not proxy_port_ready(ch.proxy_port):
+        log(f"[CH{ch.index}] 本地代理端口 {ch.proxy_port} 无响应，放弃本次连接")
+        stop_process(proc)
+        cleanup_policy_routing(table)
+        ch.state = "error"; ch.error = f"proxy port {ch.proxy_port} not listening"
+        ch.last_node_data = None
+        release_slot(ch)
+        return False
+
     with ch.lock:
             ch.process = proc
             ch.state = "connected"
@@ -785,14 +950,13 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             ch.last_node_data = node
             ch.fail_streak = 0
             ch.reserved_ip = ""   # 预占转正：node_ip 已生效，无需再占位
-    setup_policy_routing(ch.tun, 100 + ch.index)
-    log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip}")
+    log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip} (table {table})")
     return True
 
 def disconnect_channel(ch: Channel):
     with ch.lock:
         stop_process(ch.process); ch.process = None
-        cleanup_policy_routing(100 + ch.index)
+        cleanup_policy_routing(policy_table(ch.index))
         ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
         ch.node_country = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
         ch.node_ip_reason = ""; ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0
@@ -800,20 +964,72 @@ def disconnect_channel(ch: Channel):
         # Keep config file for watchdog retry
     log(f"[CH{ch.index}] Disconnected")
 
-def start_all_proxies():
-    import proxy_server_multi as proxy
+def port_bindable(family: int, addr: tuple) -> str:
+    """端口能不能绑；返回空串=可用，否则返回原因。"""
+    s = None
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(addr)
+        return ""
+    except OSError as e:
+        return str(e)
+    finally:
+        if s is not None:
+            try: s.close()
+            except OSError: pass
+
+def preflight_ports() -> dict[str, str]:
+    """启动前先探一遍要用的端口，把冲突提前暴露出来。
+
+    9 条通道要占 10 个端口（面板 8787 + 代理 47928~47936）。任一被占，
+    服务要么起不来要么某个通道静默失效，日志里只有子线程的一行 print，
+    排查起来很绕。这里在主线程里一次探清，直接写进启动日志。
+    """
+    problems: dict[str, str] = {}
+    if port_bindable(socket.AF_INET6, ("::", UI_PORT)) and port_bindable(socket.AF_INET, ("0.0.0.0", UI_PORT)):
+        problems["ui"] = f"面板端口 {UI_PORT} 已被占用"
     for ch in channels:
-        threading.Thread(target=proxy.start_proxy_server, args=(LOCAL_PROXY_HOST, ch.proxy_port, ch.tun), daemon=True).start()
-        time.sleep(0.1)
+        reason = port_bindable(socket.AF_INET, (LOCAL_PROXY_HOST, ch.proxy_port))
+        if reason:
+            problems[f"proxy{ch.index}"] = f"代理端口 {ch.proxy_port} 不可用: {reason}"
+    return problems
+
+def start_all_proxies() -> dict[int, str]:
+    """启动 9 个本地 SOCKS/HTTP 代理，返回 {通道号: 失败原因}，空字典=全部就绪。
+
+    关键改动：监听套接字在**主线程**里按顺序建好，再交给子线程跑 accept 循环。
+    原来是每个通道一个子线程各自 bind，绑定失败只在那个线程里 print 一行就 return，
+    主进程完全不知情 —— 9 通道下最坏会出现"面板显示 9 个已连接、实际只有 6 个在听"，
+    而且从任何界面都看不出来。现在失败会落到 ch.proxy_error，面板直接标红，
+    该通道也不会被判定为已连接。
+    """
+    import proxy_server_multi as proxy
+    failed: dict[int, str] = {}
+    for ch in channels:
+        try:
+            listener = proxy.create_proxy_listener(LOCAL_PROXY_HOST, ch.proxy_port)
+        except Exception as e:
+            msg = f"本地端口 {ch.proxy_port} 绑定失败: {e}"
+            failed[ch.index] = msg
+            ch.proxy_error = msg
+            log(f"[proxy] CH{ch.index} {msg}")
+            continue
+        ch.proxy_error = ""
+        threading.Thread(target=proxy.serve_proxy,
+                         args=(listener, LOCAL_PROXY_HOST, ch.proxy_port, ch.tun),
+                         daemon=True).start()
+        time.sleep(0.05)   # 略微错开，让监听日志按通道顺序打印
+    ok = len(channels) - len(failed)
+    log(f"[init] 代理端口就绪 {ok}/{len(channels)}" + (f"，失败通道: {sorted(failed)}" if failed else ""))
+    return failed
 
 # === Node Fetching ===
-def fetch_nodes() -> list[dict[str, Any]]:
-    log("[fetch] Fetching nodes...")
-    try:
-        req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except Exception as e: log(f"[fetch] Failed: {e}"); return []
+_last_fetch_source = ""      # 最近一次节点数据的来源（在线地址 / snapshot / 空）
+_snapshot_saved_at = 0.0     # 本地快照的保存时间（内存里记一份，避免状态接口每次都读大文件）
+
+def _parse_vpngate_csv(raw: str) -> list[dict[str, Any]]:
+    """解析 VPNGate 返回的 CSV 文本，按"延迟+速度"粗排。"""
     lines = raw.strip().split("\n")
     start = 0
     if lines and lines[0].startswith("*"): start = 1
@@ -844,8 +1060,73 @@ def fetch_nodes() -> list[dict[str, Any]]:
         s = n["speed"] if n["speed"] > 0 else 999
         return p + (s if s < 100 else s * 2)
     nodes.sort(key=score)
-    nodes = nodes[:300]
     return nodes
+
+def save_nodes_snapshot(nodes: list[dict[str, Any]]) -> None:
+    """把这次拉到的节点完整落盘（**含 config_text**）。
+
+    必须留配置文本：回退时拿到的节点没有配置就没法建隧道，等于没回退。
+    所以这里不能复用 nodes.json —— 那份是给面板看的，刻意剥离了配置。
+    """
+    try:
+        write_json(NODES_SNAPSHOT_FILE, {"saved_at": time.time(), "nodes": nodes})
+        global _snapshot_saved_at
+        _snapshot_saved_at = time.time()
+    except Exception as e:
+        log(f"[fetch] 节点快照写入失败: {e}")
+
+def load_nodes_snapshot() -> tuple[list[dict[str, Any]], float]:
+    """读本地节点快照，返回 (可用节点, 保存时间戳)。"""
+    global _snapshot_saved_at
+    data = read_json(NODES_SNAPSHOT_FILE)
+    if not isinstance(data, dict): return [], 0.0
+    raw_nodes = data.get("nodes")
+    if not isinstance(raw_nodes, list): return [], 0.0
+    good = [n for n in raw_nodes if isinstance(n, dict) and n.get("ip") and n.get("config_text")]
+    try: saved_at = float(data.get("saved_at") or 0.0)
+    except (TypeError, ValueError): saved_at = 0.0
+    _snapshot_saved_at = saved_at
+    return good, saved_at
+
+def _fetch_raw(url: str, timeout: int = 30) -> str | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log(f"[fetch] {url} 失败: {e}")
+        return None
+
+def fetch_nodes() -> list[dict[str, Any]]:
+    """取节点：官方 HTTPS → 官方 HTTP → 本地快照。
+
+    只保留一个源的时候，源一挂 9 条通道全部没节点可用；快照这一级保证
+    "至少还能用上次那批节点把隧道建起来"，而不是整个面板空掉。
+    """
+    global _last_fetch_source
+    log("[fetch] Fetching nodes...")
+    for url in API_URLS:
+        raw = _fetch_raw(url)
+        if not raw: continue
+        nodes = _parse_vpngate_csv(raw)
+        if not nodes:
+            log(f"[fetch] {url} 返回了 {len(raw)} 字节但解析不出节点，换下一个源")
+            continue
+        nodes = nodes[:300]        # 与节点池上限对齐
+        _last_fetch_source = url
+        save_nodes_snapshot(nodes)
+        log(f"[fetch] {len(nodes)} nodes from {url}")
+        return nodes
+    nodes, saved_at = load_nodes_snapshot()
+    if nodes:
+        age = (time.time() - saved_at) / 3600 if saved_at else -1
+        _last_fetch_source = "snapshot"
+        tip = f"（快照保存于 {age:.1f} 小时前）" if age >= 0 else ""
+        log(f"[fetch] 在线源全部不可用，回退本地快照: {len(nodes)} 个节点{tip}")
+        return nodes
+    _last_fetch_source = ""
+    log("[fetch] 在线源与本地快照都不可用，本次没有节点")
+    return []
 
 def refresh_nodes_once(tag: str = "fetch") -> dict[str, Any]:
     """拉一次节点：补全 IP 信息 → 合并上轮指标 → 打新节点标记 → 落盘。
@@ -856,7 +1137,8 @@ def refresh_nodes_once(tag: str = "fetch") -> dict[str, Any]:
     global nodes_cache, _last_node_ids
     nodes = fetch_nodes()
     if not nodes:
-        return {"total": 0, "new": 0, "new_ids": []}
+        return {"total": 0, "new": 0, "new_ids": [], "baseline": False,
+                "source": _last_fetch_source}
     try: vpn_utils.enrich_ip_info(nodes)
     except Exception as e: log(f"[enrich] Error: {e}")
     merge_node_metrics(nodes)            # 上轮测出的延迟/带宽不能被整池替换冲掉
@@ -867,24 +1149,30 @@ def refresh_nodes_once(tag: str = "fetch") -> dict[str, Any]:
     _prune_seen(new_ids)
     persist_nodes()
     save_seen_nodes()
-    log(f"[{tag}] {len(nodes)} nodes (new:{ann['new']})")
+    src = "" if _last_fetch_source in ("", "snapshot") else _last_fetch_source
+    log(f"[{tag}] {len(nodes)} nodes (new:{ann['new']})"
+        + ("  ← 本地快照" if _last_fetch_source == "snapshot" else ""))
     return {"total": len(nodes), "new": ann["new"],
-            "new_ids": ann["new_ids"], "baseline": ann["baseline"]}
+            "new_ids": ann["new_ids"], "baseline": ann["baseline"],
+            "source": _last_fetch_source, "url": src}
 
 
 def manual_fetch() -> dict:
-    """手动拉取一次节点。返回 {new, dup, total, baseline, new_ids}。
+    """手动拉取一次节点。返回 {new, dup, total, baseline, new_ids, source}。
 
-    new = 本次刷新新出现的节点数（对比持久化的首现记录）
-    dup = 之前就已经见过的节点数
+    new    = 本次刷新新出现的节点数（对比持久化的首现记录）
+    dup    = 之前就已经见过的节点数
+    source = 数据来源；为 "snapshot" 说明在线源全挂了、用的是本地快照
     """
-    result: dict[str, Any] = {"new": 0, "dup": 0, "total": 0, "baseline": False, "new_ids": []}
+    result: dict[str, Any] = {"new": 0, "dup": 0, "total": 0, "baseline": False,
+                              "new_ids": [], "source": ""}
     try:
         r = refresh_nodes_once("manual_fetch")
         result["total"] = r["total"]
         result["new"] = r["new"]
         result["new_ids"] = r.get("new_ids", [])
         result["baseline"] = bool(r.get("baseline"))
+        result["source"] = r.get("source", "")
         result["dup"] = max(0, r["total"] - r["new"]) if not r.get("baseline") else 0
     except Exception as e:
         log(f"[manual_fetch] Error: {e}")
@@ -1426,7 +1714,13 @@ function render(d){
     }else if(c.speed_error){
       h+='<div class="i"><span class="ll">实测带宽</span><span style="color:#ef4444;font-size:11px" title="'+esc(c.speed_error)+'">测速失败</span></div>';
     }
-    h+='<div class="i"><span class="ll">代理</span><span>:'+c.proxy_port+'</span></div>';
+    if(c.proxy_error){
+      // 本地代理端口没起来：隧道就算通了也没法通过它访问，必须显式标出来，
+      // 否则面板看着一切正常、实际这条通道用不了
+      h+='<div class="i"><span class="ll">代理</span><span style="color:#ef4444;font-size:11px" title="'+esc(c.proxy_error)+'">端口 '+c.proxy_port+' 未监听</span></div>';
+    }else{
+      h+='<div class="i"><span class="ll">代理</span><span>:'+c.proxy_port+'</span></div>';
+    }
     if(c.error) h+='<div class="i"><span class="ll">错误</span><span style="color:#ef4444">'+c.error+'</span></div>';
     h+='<label class="tog" title="关掉后该通道不再自动重连（等于手动断开）"><input type="checkbox" id="tog_'+c.index+'"'+(c.enabled?' checked':'')+' onchange="toggleChannel('+c.index+')">守护自动重连</label>';
     h+='</div><div class="ac"><select id="cs_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
@@ -1449,7 +1743,14 @@ function render(d){
     h+='<button class="btn d" onclick="dc('+c.index+')"'+(c.state!=='connected'||c.speed_testing?' disabled':'')+'>断开</button>';
     h+='</div></div>';
   }
-  g.innerHTML=h; document.getElementById('nc').textContent='节点: '+(d.node_count||0)+(d.new_node_count>0?(' · 新 '+d.new_node_count):'');
+  g.innerHTML=h;
+  var ncEl=document.getElementById('nc');
+  if(ncEl){
+    ncEl.textContent='节点: '+(d.node_count||0)
+      +(d.new_node_count>0?(' · 新 '+d.new_node_count):'')
+      +(d.nodes_source==='snapshot'?' · 用的是本地快照':'');
+    ncEl.style.color=(d.nodes_source==='snapshot')?'#f59e0b':'';   // 回退到快照时给个显眼提示
+  }
   _CS=d.country_stats||{}; _CTRY=d.countries||[];
   updateJobs(d);
   var am=document.getElementById('assignModal');
@@ -1482,6 +1783,7 @@ async function fetchNodes(){
       if(d.baseline) msg+=', 已建立基线';
       if(d.new>0) msg+=', 新增 '+d.new;
       if(d.dup>0) msg+=', 重复 '+d.dup;
+      if(d.source==='snapshot') msg+=' ⚠ 在线源不可用，用的是本地快照';
       document.getElementById('rc').textContent=msg;
     }
   }catch(e){}
@@ -1993,7 +2295,10 @@ class Handler(BaseHTTPRequestHandler):
                             "tested_count":tested_count,
                             "latency_count":latency_count,
                             "ping_task":ping_task,
-                            "speed_task":speed_task})
+                            "speed_task":speed_task,
+                            "nodes_source":_last_fetch_source,
+                            "nodes_snapshot_at":_snapshot_saved_at,
+                            "policy_table_base":POLICY_TABLE_BASE})
         elif path == "/api/nodes":
             filter_type = params.get("filter",[""])[0]
             country = params.get("country",[""])[0]
@@ -2135,7 +2440,7 @@ class Handler(BaseHTTPRequestHandler):
             res = manual_fetch()
             self.send_json({"ok": True, "new": res["new"], "dup": res["dup"],
                             "total": res["total"], "baseline": res["baseline"],
-                            "new_ids": res["new_ids"]})
+                            "new_ids": res["new_ids"], "source": res.get("source", "")})
             return
 
         # --- 清空"新"标记（首现历史保留，只挪水位线）---
@@ -2423,7 +2728,7 @@ def channel_watchdog():
                     with ch.lock:
                         stop_process(ch.process)
                         ch.process = None
-                        cleanup_policy_routing(100 + ch.index)
+                        cleanup_policy_routing(policy_table(ch.index))
                         ch.state = "disconnected"
                         ch.last_node_data = None
                     log(f"[WD CH{ch.index}] {reason} 连续 {FAIL_TOLERANCE} 轮，准备重连")
@@ -2463,23 +2768,36 @@ def main():
     load_seen_nodes()   # 必须在采集线程启动前恢复基准，否则重启会把整池节点当成新节点刷一遍
     if is_default_credentials():
         log("[auth] 提醒: 面板仍是默认账号 admin/admin，请登录后点右上角\"管理员\"修改")
-    try: subprocess.run(["pkill","-f","openvpn"], timeout=5, capture_output=True)
-    except: pass
+    # 清理上次运行残留：只动**本程序启动的** openvpn。
+    # 原实现是一句裸的 pkill -f openvpn，会把这台机器上别的 openvpn（另一个出口、
+    # 或正在手工调试的隧道）一起干掉，而且不留痕迹。
+    cleanup_stale_openvpn()
+    for ch in channels:
+        # tun 设备已经随进程消失，但上次写的 ip rule/route 会留在内核里继续劫持流量
+        cleanup_policy_routing(policy_table(ch.index))
+    port_problems = preflight_ports()
+    for msg in port_problems.values():
+        log(f"[init] 端口预检: {msg}")
     ch_cfg = read_json(CHANNELS_FILE)
     for ch in channels:
         c = ch_cfg.get(str(ch.index),{})
         ch.force_country = c.get("force_country","")
         ch.force_ip_type = c.get("force_ip_type","")
         ch.enabled = c.get("enabled", bool(ch.force_country))
-    start_all_proxies()
-    log(f"[init] {len(channels)} proxies started")
+    proxy_failures = start_all_proxies()
+    if proxy_failures:
+        log(f"[init] 警告: {len(proxy_failures)} 个通道的本地代理没起来，"
+            f"这些通道即使隧道通了也无法通过代理访问（面板会标红）")
     threading.Thread(target=collector_loop, daemon=True).start()
     log("[init] Collector started")
     threading.Thread(target=channel_watchdog, daemon=True).start()
     log("[init] Watchdog started")
     time.sleep(2)
     # 首次采集（走统一入口，保证新节点标记与后续每轮口径一致）
-    refresh_nodes_once("init")
+    init_fetch = refresh_nodes_once("init")
+    if not init_fetch.get("total"):
+        log("[init] 警告: 首次节点采集为空（网络不通或节点源不可用），"
+            "守护进程会在下一轮重试；也可在面板点\"获取节点\"")
     for ch in channels:
         if ch.force_country:
             node = get_best_node_for_country(ch.force_country, ch.force_ip_type, exclude_ch=ch)

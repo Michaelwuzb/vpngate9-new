@@ -1,4 +1,9 @@
 #!/bin/bash
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -7,9 +12,22 @@ if [ "$(id -u)" != "0" ]; then echo -e "${RED}必须以 root 权限运行${NC}";
 
 INSTALL_DIR="/opt/michaelvpn"
 SERVICE_NAME="michaelvpn"
+# 默认装 vpngate9-new（完整版：源码 + tests/ + docs/）。
+# 想装别的分支/仓库: bash install.sh <owner> <repo>
 REPO_OWNER="${1:-Michaelwuzb}"
-REPO_NAME="${2:-vpngate9}"
+REPO_NAME="${2:-vpngate9-new}"
 BRANCH="main"
+
+# 策略路由表号：通道 i 用 200+i（主程序里的 POLICY_TABLE_BASE=200）。
+# 卸载时必须清干净：tun 设备会随进程消失，但 ip rule/route 会留在内核里，
+# 继续把别人的流量往已经不存在的设备上引。
+cleanup_policy_routing() {
+    for t in $(seq 200 208); do
+        # ip rule del 每次只删一条匹配项，必须循环删到删不动
+        while ip rule del table "$t" 2>/dev/null; do :; done
+        ip route flush table "$t" 2>/dev/null || true
+    done
+}
 
 # === 卸载功能 ===
 if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "卸载" ]; then
@@ -18,6 +36,7 @@ if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "卸载" ]; then
     systemctl disable ${SERVICE_NAME} 2>/dev/null || true
     rm -f /lib/systemd/system/${SERVICE_NAME}.service
     systemctl daemon-reload
+    cleanup_policy_routing
     rm -rf "$INSTALL_DIR"
     rm -f /usr/bin/ml
     rm -f /etc/sysctl.d/99-${SERVICE_NAME}.conf
@@ -172,6 +191,11 @@ case "${1:-status}" in
         systemctl disable michaelvpn 2>/dev/null || true
         rm -f /lib/systemd/system/michaelvpn.service
         systemctl daemon-reload
+        # 清掉 9 条通道写的策略路由（tun 没了但 ip rule 还在，会劫持其它程序的流量）
+        for t in $(seq 200 208); do
+            while ip rule del table "$t" 2>/dev/null; do :; done
+            ip route flush table "$t" 2>/dev/null || true
+        done
         rm -rf /opt/michaelvpn
         rm -f /usr/bin/ml
         rm -f /etc/sysctl.d/99-michaelvpn.conf
@@ -237,6 +261,7 @@ echo -e "  默认密码:  ${CYAN}admin${NC}"
 echo -e "  ${YELLOW}请登录后点右上角\"管理员\"立即修改账号和密码${NC} (改完需重新登录)"
 echo -e "  忘记密码:  ${CYAN}ml passwd <新密码>${NC}  或  ${CYAN}ml passwd <新账号> <新密码>${NC}"
 echo -e "  代理端口:  ${CYAN}47928~47936${NC} (tun0~tun8)"
+echo -e "  策略路由:  ${CYAN}table 200~208${NC} (卸载时自动清理)"
 echo -e "  状态:      ${CYAN}ml status${NC}"
 echo -e "  日志:      ${CYAN}ml logs${NC}"
 echo -e "  卸载:      ${CYAN}ml uninstall${NC}"

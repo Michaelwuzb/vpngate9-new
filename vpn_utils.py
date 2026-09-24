@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
 from __future__ import annotations
 import json
 import os

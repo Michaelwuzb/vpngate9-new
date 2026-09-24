@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
 # vpngate9 通道守护脚本（稳定版）
 # 功能:
 #   1) 定时检查 9 个通道, 发现"假连接"(面板显示 connected 但 SOCKS5 实测拿不到出口IP)自动换节点
@@ -21,8 +26,8 @@ import urllib.request
 PANEL = os.environ.get("PANEL", "http://127.0.0.1:8787")
 AUTH_FILE = os.environ.get("VPNGATE_UI_AUTH", "/opt/michaelvpn/vpngate_data/ui_auth.json")
 GUARD_TOKEN_FILE = os.environ.get("VPNGATE_GUARD_TOKEN_FILE", "/opt/michaelvpn/vpngate_data/guard_token")
-NUM_CHANNELS = 9
-PROXY_BASE_PORT = 47928
+NUM_CHANNELS = 9            # 已废弃：通道数一律以面板 /api/status 为准（保留仅为兼容旧文档）
+PROXY_BASE_PORT = 47928     # 仅当面板是老版本、不返回 proxy_port 时的兜底推算基准
 CHECK_EVERY = 60            # 每 60 秒检查一轮
 ROTATE_EVERY = 30           # 每 30 轮主动换节点切 IP (0=不主动切)
 FAIL_TOLERANCE = 2          # 连续 N 轮 SOCKS 测不出流量才判定假连接
@@ -161,8 +166,8 @@ def reconnect(idx: int, country: str, ip_type: str, node_id=None):
 def main() -> None:
     global cookie   # 面板无响应时要真的把会话清掉(否则下一轮 api() 不会重新登录)
     tok_mode = bool(_load_guard_token())
-    print("vpngate9 guard start: %d channels, every %ds, handle_disconnected=%s, auth=%s"
-          % (NUM_CHANNELS, CHECK_EVERY, HANDLE_DISCONNECTED,
+    print("vpngate9 guard start: every %ds, handle_disconnected=%s, auth=%s"
+          % (CHECK_EVERY, HANDLE_DISCONNECTED,
              "guard_token" if tok_mode else "account/password"), flush=True)
     if not tok_mode:
         warn_once("未使用守护令牌, 改用账号密码登录; 面板改密后需同步 %s, "
@@ -183,6 +188,10 @@ def main() -> None:
             continue
 
         do_rotate = (ROTATE_EVERY > 0 and round_n % ROTATE_EVERY == 0)
+        if round_n == 1:
+            # 通道数从面板读，不在这里写死：改通道数时忘了同步这个常量，
+            # 守护就会按错的端口去探活，把正常通道全判成挂了。
+            print("[%s] 面板报告 %d 个通道" % (T, len(st.get("channels", []))), flush=True)
 
         for ch in st.get("channels", []):
             # 关键修复: 先取出 idx 再做任何判断。
@@ -195,7 +204,13 @@ def main() -> None:
                 continue
 
             state = ch.get("state")
-            port = PROXY_BASE_PORT + idx
+            # 端口直接取面板给的 proxy_port，不再自己按 PROXY_BASE_PORT + idx 推算。
+            # 推算的写法把"端口基准值"抄成了两份常量：面板那边一改，这里就会去连
+            # 一个没人监听的端口，把好好的通道判成"假连接"然后乱换节点。
+            port = ch.get("proxy_port")
+            if not isinstance(port, int):
+                warn_once("面板没有返回 proxy_port(旧版面板?)，回退按 %d+idx 推算" % PROXY_BASE_PORT)
+                port = PROXY_BASE_PORT + idx
             need = False
             reason = ""
 
