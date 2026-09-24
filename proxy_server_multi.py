@@ -415,16 +415,18 @@ def start_proxy_server(host: str, port: int, tun_dev: str = "tun0") -> None:
             except Exception:
                 pass
         if is_ipv6 and host in ("::", ""):
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 0.0.0.0 ...", flush=True)
+            # 回退只退到 IPv4 回环。原实现回退到 0.0.0.0，会让 9 个 SOCKS5 端口
+            # 在没有认证(proxy_auth 默认关闭)的情况下直接暴露到公网。
+            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
             try:
                 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("0.0.0.0", port))
+                server.bind(("127.0.0.1", port))
                 server.listen(256)
-                print(f"HTTP/SOCKS5 proxy [{tun_dev}] listening on 0.0.0.0:{port} (仅 IPv4)", flush=True)
+                print(f"HTTP/SOCKS5 proxy [{tun_dev}] listening on 127.0.0.1:{port} (仅 IPv4)", flush=True)
             except Exception as ex:
                 import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="0.0.0.0")
+                diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
                 diag_msg = diag[1] if diag else str(ex)
                 print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 0.0.0.0:{port}: {diag_msg}", flush=True)
                 return

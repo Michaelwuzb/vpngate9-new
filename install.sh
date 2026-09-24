@@ -90,10 +90,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div class="logo">MichaelVPN</div>
 <div class="sub">9通道 VPN 管理面板</div>
 <form method="post" action="/api/login">
-<div class="fg"><label>管理账号</label><input type="text" name="username" required></div>
-<div class="fg"><label>安全密码</label><input type="password" name="password" required></div>
+<div class="fg"><label>管理账号</label><input type="text" name="username" required autocomplete="username"></div>
+<div class="fg"><label>安全密码</label><input type="password" name="password" required autocomplete="current-password"></div>
 <button class="btn" type="submit">登录</button>
-<div class="err">账号或密码错误</div>
+<div class="err" style="display:${error_display}">${error_text}</div>
 </form>
 </div>
 </body>
@@ -102,11 +102,32 @@ LOGINEOF
     fi
 
     # Generate default auth if missing
+    # 首次启动时面板会把它自动升级成 PBKDF2 哈希(明文只在首次存在)
     if [ ! -f "$INSTALL_DIR/vpngate_data/ui_auth.json" ]; then
-        echo '{"username":"admin","password": "admin"}' > "$INSTALL_DIR/vpngate_data/ui_auth.json"
+        echo '{"username":"admin","password":"admin"}' > "$INSTALL_DIR/vpngate_data/ui_auth.json"
     fi
+    # 若存在旧的明文格式, 启动前先就地升级为哈希
+    python3 - "$INSTALL_DIR" << 'PYEOF' 2>/dev/null || true
+import json, os, secrets, hashlib, sys
+d = sys.argv[1]; p = os.path.join(d, "vpngate_data", "ui_auth.json")
+try:
+    cfg = json.load(open(p, encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+if cfg.get("password_hash") or "password" not in cfg:
+    sys.exit(0)
+salt = secrets.token_hex(16)
+dk = hashlib.pbkdf2_hmac("sha256", str(cfg.get("password", "admin")).encode(), bytes.fromhex(salt), 200000)
+cfg = {"username": cfg.get("username", "admin"),
+       "password_hash": "pbkdf2_sha256$200000$%s$%s" % (salt, dk.hex())}
+open(p, "w", encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False, indent=2))
+print("  ui_auth.json 明文密码已升级为哈希")
+PYEOF
 
     chmod -R 755 "$INSTALL_DIR"
+    # 面板凭据与守护令牌都不能全机可读
+    chmod 600 "$INSTALL_DIR/vpngate_data/ui_auth.json" 2>/dev/null || true
+    chmod 600 "$INSTALL_DIR/vpngate_data/guard_token" 2>/dev/null || true
     echo -e "${GREEN}  OK${NC}"
 }
 
@@ -115,7 +136,10 @@ install_service() {
     cat > /lib/systemd/system/${SERVICE_NAME}.service << 'SERVICEEOF'
 [Unit]
 Description=MichaelVPN 9-Channel VPN Gateway
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
+# 崩溃后允许无限重启（默认 5 次/10 秒 就会被 systemd 放弃）
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -123,6 +147,8 @@ WorkingDirectory=/opt/michaelvpn
 ExecStart=/usr/bin/python3 /opt/michaelvpn/vpngate9_multi.py
 Restart=always
 RestartSec=5
+# 9 个代理端口 + 99 个隧道相关连接，默认 1024 会不够
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -161,7 +187,17 @@ for c in d['channels']:
     print(f'CH{c[\"index\"]}: {s:15s} {co:20s} IP={ip:16s} :{c[\"proxy_port\"]}')
 print(f'--- {d[\"node_count\"]} nodes ---')" 2>/dev/null || systemctl status michaelvpn --no-pager ;;
     logs)    journalctl -u michaelvpn --no-pager -n 50 -f ;;
-    *)       echo "用法: ml {start|stop|restart|status|logs|uninstall}" ;;
+    passwd|改密)
+        shift
+        if [ $# -eq 0 ]; then
+            echo "用法: ml passwd <新密码>              只改密码"
+            echo "      ml passwd <新账号> <新密码>    同时改账号和密码"
+            echo "      (更推荐登录面板 → 右上角\"管理员\"里修改)"
+            exit 1
+        fi
+        python3 /opt/michaelvpn/vpngate9_multi.py --set-credentials "$@" || exit 1
+        systemctl restart michaelvpn 2>/dev/null ;;
+    *)       echo "用法: ml {start|stop|restart|status|logs|passwd|uninstall}" ;;
 esac
 MLEOF
     chmod +x /usr/bin/ml
@@ -198,6 +234,8 @@ echo ""
 echo -e "  Web UI:    ${CYAN}http://${PUBLIC_IP}:8787/${NC}"
 echo -e "  默认账号:  ${CYAN}admin${NC}"
 echo -e "  默认密码:  ${CYAN}admin${NC}"
+echo -e "  ${YELLOW}请登录后点右上角\"管理员\"立即修改账号和密码${NC} (改完需重新登录)"
+echo -e "  忘记密码:  ${CYAN}ml passwd <新密码>${NC}  或  ${CYAN}ml passwd <新账号> <新密码>${NC}"
 echo -e "  代理端口:  ${CYAN}47928~47936${NC} (tun0~tun8)"
 echo -e "  状态:      ${CYAN}ml status${NC}"
 echo -e "  日志:      ${CYAN}ml logs${NC}"

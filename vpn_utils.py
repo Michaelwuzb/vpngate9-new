@@ -308,6 +308,48 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
         return fallback_ping
     return 0
 
+def probe_tunnel(tun_dev: str, timeout: int = 3) -> bool:
+    """隧道判活：先用绑定该 tun 的 TCP 连接探测，失败再退回 ping。
+
+    为什么要改：不少 VPNGate 节点会丢弃 ICMP，隧道其实通着，但 `ping -I tunN
+    8.8.8.8` 一直超时，原实现据此判定"隧道死了"→ 反复换节点，表现成通道闪断。
+    TCP 探测走的是真实数据通道，比 ICMP 可靠得多。
+    """
+    # 1) TCP 探测（必须成功绑定到 tun，否则包会走物理网卡出去，变成假活）
+    for target in ("1.1.1.1", "8.8.8.8"):
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            bound = False
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, tun_dev.encode("utf-8"))
+                bound = True
+            except OSError:
+                bound = False
+            if not bound:
+                # 绑不上设备就别做 TCP 探测，避免误判为"活"
+                break
+            s.connect((target, 53))
+            return True
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    # 2) ping 兜底
+    try:
+        r = subprocess.run(["ping", "-I", tun_dev, "-c", "1", "-W", str(timeout), "8.8.8.8"],
+                           capture_output=True, timeout=timeout + 2)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def check_and_fix_dns() -> None:
     """
     Checks if DNS resolution is broken.
@@ -376,6 +418,190 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
         except Exception:
             pass
 
+# ============================================================================
+# IP 类型判定（住宅 / 机房 / 移动）
+# ----------------------------------------------------------------------------
+# 为什么不能直接用 ip-api 的字段：
+#   1) `proxy=true` 只表示"这个 IP 是 VPN/代理出口"。VPNGate 的节点不管宿主是
+#      家宽还是机房，这个字段几乎都是 true —— 拿它当机房判据会把人家的 SoftBank
+#      家宽、KT 家宽全标成"机房IP"。
+#   2) `hosting` 字段漏报严重：实测 98 个节点里只有 2 个为 true，连 DigitalOcean、
+#      SoftEther 自建服务器这种明确的机房都标 false。
+# 所以改为「ASN/机构关键词 + PTR 反向域名特征」为主，ip-api 标记只作最后兜底。
+# 改动判定规则后请把 _CLS_VER 加一，旧缓存会自动失效重查。
+# ============================================================================
+_CLS_VER = 4
+_IP_API_FIELDS = "status,message,query,country,regionName,city,isp,org,as,asname,hosting,mobile,proxy"
+
+# 云 / 机房 / IDC 特征（机构名、ISP 名、AS 名里出现即判机房）
+HOSTING_KEYS: tuple[str, ...] = (
+    "amazon", "aws", "googleusercontent", "google cloud", "1e100", "microsoft", "azure",
+    "oracle", "alibaba", "aliyun", "tencent", "huawei cloud", "ucloud",
+    "digitalocean", "vultr", "choopa", "linode", "akamai", "hetzner", "ovh", "kimsufi",
+    "contabo", "scaleway", "leaseweb", "colocrossing", "quadranet", "psychz", "multacom",
+    "hostwinds", "hostinger", "namecheap", "godaddy", "ionos", "racknerd", "sharktech",
+    "fdcservers", "krypt", "equinix", "m247", "datacamp", "performive", "liquidweb",
+    "inmotion", "hostdare", "hostus", "frantech", "buyvm", "cloudflare", "fastly",
+    "softether", "vpngate", "open.ad.jp", "telecommunication research",
+    "hosted", "hosting", "datacenter", "data center", "colocation", " idc", "idc ",
+    "cloud server", "virtual private", " vps", "vps ", "dedicated server",
+)
+
+# 移动网络特征（蜂窝网络）
+# 注意：这里刻意不写裸的 "docomo"，因为 "NTT DOCOMO BUSINESS" 是企业固网业务，
+# 会被误判成移动网络；用带逗号的 "docomo, inc" 才能精确匹配消费者移动网。
+MOBILE_KEYS: tuple[str, ...] = (
+    "mobile", "cellular", "wireless", "lte", "docomo, inc", "t-mobile",
+    "china mobile", "sk telecom", "vodafone mobile", "orange mobile",
+)
+
+# 消费级宽带 ISP（家宽）特征
+RESIDENTIAL_ISP_KEYS: tuple[str, ...] = (
+    # 日本
+    "softbank", "bbtec", "kddi", "dion", "au one net", "au-net", "optage", "k-opticom",
+    "ntt communications", "ocn", "plala", "chubu telecommunication", "commufa",
+    "sony network", "nuro", "arteria", "biglobe", "nec corporation", "tokai",
+    "jupiter telecommunication", "asahi net", "so-net", "nifty", "iij", "infoweb",
+    "mesh.ad.jp", "wakwak", "yahoobb", "jcom", "itscom",
+    # 韩国
+    "korea telecom", "kornet", "kt corp", "sk broadband", "broadnnet", "lg powercomm",
+    "xpeed", "cj hello", "hvsilla", "hyundai hcn", "skylife", "dreamline",
+    # 东南亚
+    "tot public", "triple t", "true internet", "true corp", "3bb", "cat telecom",
+    "fpt telecom", "viettel", "vnpt", "vietnam internet", "china unicom", "china telecom",
+    # 俄罗斯 / 欧洲
+    "rostelecom", "ttk", "er-telecom", "beeline", "megafon", "mts ",
+    "virgin media", "bt ", "sky broadband", "talktalk", "proximus", "swisscom",
+    "deutsche telekom", "telefonica", "movistar", "orange s.a", "orange polska", "sfr",
+    # 北美 / 大洋洲
+    "comcast", "charter", "spectrum", "cox ", "centurylink", "at&t", "verizon",
+    "frontier", "general communication", "gci", "telstra", "optus", "shaw", "rogers",
+    "bell canada", "telus",
+)
+
+# PTR（反向域名）里出现的家宽 / 动态地址池特征
+RESIDENTIAL_PTR_KEYS: tuple[str, ...] = (
+    ".bbtec.net", "ocn.ne.jp", "plala.or.jp", "dion.ne.jp", "au-net.ne.jp",
+    "biglobe.ne.jp", "so-net.ne.jp", "nifty.com", "infoweb.ne.jp", "mesh.ad.jp",
+    "commufa.jp", "nuro.jp", "cable.", "virtuallink", "dynamic.", ".dyn.", "pool-",
+    "pool.", ".pool", "broadband", "dsl.", "adsl", "ppp.", "cust.", "static.",
+    "virginm.net", "comcast.net", "hsd1.", "res.spectrum", "frontiernet.net", "gci.net",
+    "kt.com", "kornet.net", "skbroadband.com", "xpeed.net", "nt-isp.net", "bbtec.jp",
+)
+
+# PTR 里的机房 / 云特征（比机构名更可靠，因为 PTR 由机房自己设置）
+HOSTING_PTR_KEYS: tuple[str, ...] = (
+    "amazonaws", "googleusercontent", "cloudapp", "1e100.net", "azure", "oraclecloud",
+    "digitalocean", "vultr", "choopa", "linode", "akamai", "hetzner", "your-server.de",
+    "ovh.net", "kimsufi", "contabo", "scaleway", "leaseweb", "colocrossing",
+    "quadranet", "psychz", "hostwinds", "racknerd", "softether", "vpngate", "open.ad.jp",
+    "vps", "cloud", "server", "hosting", "datacenter", "idc",
+)
+
+
+def _kw_hit(blob: str, keys: tuple[str, ...]) -> str:
+    for k in keys:
+        if k in blob:
+            return k
+    return ""
+
+
+def classify_ip_type(isp: str, org: str, asname: str, ptr: str = "",
+                     flag_hosting: bool = False, flag_mobile: bool = False,
+                     ) -> tuple[str, str, bool]:
+    """判定节点 IP 类型，返回 (ip_type, reason, need_ptr)。
+
+    ip_type 取值: residential(住宅/家宽) / hosting(机房) / mobile(移动)
+    need_ptr 为 True 表示机构关键词没给出结论，建议再用 PTR 反查一次。
+    """
+    blob = " ".join([isp or "", org or "", asname or ""]).lower()
+    ptr_l = (ptr or "").lower()
+
+    # 1) 移动网络优先（"SoftBank Mobile" / "NTT Docomo" / AIS 等）
+    hit = _kw_hit(blob, MOBILE_KEYS)
+    if hit:
+        return "mobile", f"机构关键词命中移动运营商({hit})", False
+
+    # 2) 云 / 机房 / IDC
+    hit = _kw_hit(blob, HOSTING_KEYS)
+    if hit:
+        return "hosting", f"机构关键词命中机房/云({hit})", False
+
+    # 3) 消费级宽带 ISP -> 家宽
+    hit = _kw_hit(blob, RESIDENTIAL_ISP_KEYS)
+    if hit:
+        return "residential", f"机构关键词命中宽带运营商({hit})", False
+
+    # 4) 关键词没结论，交给 PTR 反查
+    if not ptr:
+        return "residential", "待定(需 PTR 反查)", True
+
+    hit = _kw_hit(ptr_l, RESIDENTIAL_PTR_KEYS)
+    if hit:
+        return "residential", f"PTR 命中家宽/动态地址特征({hit})", False
+    hit = _kw_hit(ptr_l, HOSTING_PTR_KEYS)
+    if hit:
+        return "hosting", f"PTR 命中机房特征({hit})", False
+
+    # 5) 兜底才用 ip-api 标记（hosting 漏报，proxy 不可用于判类型）
+    if flag_hosting:
+        return "hosting", "ip-api hosting 标记兜底", False
+    if flag_mobile:
+        return "mobile", "ip-api mobile 标记兜底", False
+    return "residential", "无明确机房特征，默认按家宽处理", False
+
+
+def _resolve_ptr(ips: list[str], timeout: float = 6.0, workers: int = 8,
+                 limit: int = 150) -> dict[str, str]:
+    """批量反向解析 PTR（走本地 DNS，不消耗 ip-api 额度）。
+
+    只给"关键词判不出来"的 IP 用，正常一轮只有个位数，开销可忽略。
+    """
+    out: dict[str, str] = {}
+    targets = list(dict.fromkeys(ips))[:limit]
+    if not targets:
+        return out
+    import concurrent.futures as _cf
+
+    def _one(ip: str) -> tuple[str, str]:
+        try:
+            return ip, socket.gethostbyaddr(ip)[0]
+        except Exception:
+            return ip, ""
+
+    ex = _cf.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futs = [ex.submit(_one, ip) for ip in targets]
+        done, _ = _cf.wait(futs, timeout=timeout)
+        for f in done:
+            try:
+                ip, host = f.result()
+                if host:
+                    out[ip] = host
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python 3.8 没有 cancel_futures
+            ex.shutdown(wait=False)
+    return out
+
+
+def _apply_cache_entry(node: dict[str, Any], cached: dict[str, Any]) -> None:
+    node["owner"] = cached.get("owner", "")
+    node["asn"] = cached.get("asn", "")
+    node["as_name"] = cached.get("as_name", "")
+    node["location"] = cached.get("location", "")
+    node["ip_type"] = cached.get("ip_type", "")
+    node["quality"] = cached.get("quality", cached.get("ip_type", ""))
+    node["ip_reason"] = cached.get("ip_reason", "")
+    node["ptr"] = cached.get("ptr", "")
+    node["is_vpn_exit"] = cached.get("is_vpn_exit", False)
+
+
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 1. Read cache thread-safely
     with ip_cache_lock:
@@ -388,95 +614,112 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         ip = node.get("ip") or node.get("remote_host")
         if not ip:
             continue
-        if ip in cache and now - cache[ip].get("cached_at", 0) < 7 * 24 * 3600:
-            cached = cache[ip]
-            node["owner"] = cached.get("owner", "")
-            node["asn"] = cached.get("asn", "")
-            node["as_name"] = cached.get("as_name", "")
-            node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
-            node["quality"] = cached.get("quality", "")
-        else:
-            if ip not in ips_to_query:
-                ips_to_query.append(ip)
+        cached = cache.get(ip)
+        # 缓存必须同时满足：判定算法版本一致 + 未过期。
+        # 旧缓存没有 cls_ver 字段，会判为失效并自动重查（修掉历史误判的关键）。
+        if (cached and cached.get("cls_ver") == _CLS_VER
+                and now - cached.get("cached_at", 0) < 7 * 24 * 3600):
+            _apply_cache_entry(node, cached)
+            continue
+        if ip not in ips_to_query:
+            ips_to_query.append(ip)
 
     if not ips_to_query:
         return
 
-    # 2. Perform HTTP query outside lock
-    new_entries = {}
+    # 2. 批量查询机构信息（锁外执行）
+    raw_records: dict[str, dict[str, Any]] = {}
     chunk_size = 100
     for i in range(0, len(ips_to_query), chunk_size):
         chunk = ips_to_query[i : i + chunk_size]
         payload = json.dumps(chunk).encode("utf-8")
         request = urllib.request.Request(
-            "http://ip-api.com/batch?lang=zh-CN&fields=status,message,query,country,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
+            "http://ip-api.com/batch?lang=zh-CN&fields=" + _IP_API_FIELDS,
             data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "vpngate-manager/2.2"},
+            headers={"Content-Type": "application/json", "User-Agent": "vpngate-manager/3.0"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 data = json.loads(response.read().decode("utf-8", errors="replace"))
-                if not isinstance(data, list):
-                    continue
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("status") != "success":
-                        continue
-                    query_ip = item.get("query")
-                    if not query_ip:
-                        continue
-
-                    ip_type = "residential"
-                    if item.get("mobile"):
-                        ip_type = "mobile"
-                    elif item.get("hosting") or item.get("proxy"):
-                        ip_type = "hosting"
-
-                    quality = "normal"
-                    if item.get("proxy"):
-                        quality = "proxy"
-                    elif item.get("hosting"):
-                        quality = "datacenter"
-                    elif item.get("mobile"):
-                        quality = "mobile"
-
-                    loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
-
-                    new_entries[query_ip] = {
-                        "owner": item.get("org") or item.get("isp") or "",
-                        "asn": item.get("as") or "",
-                        "as_name": item.get("asname") or "",
-                        "location": loc,
-                        "ip_type": ip_type,
-                        "quality": quality,
-                        "cached_at": now,
-                    }
         except Exception as e:
             print(f"[enrich_ip_info] Query failed: {e}", flush=True)
+            continue
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if not isinstance(item, dict) or item.get("status") != "success":
+                continue
+            qip = item.get("query")
+            if qip:
+                raw_records[qip] = item
+
+    if not raw_records:
+        return
+
+    # 3. 先按机构关键词判定；关键词给不出结论的，再用 PTR 反查兜底
+    preliminary: dict[str, tuple[str, str]] = {}
+    need_ptr: list[str] = []
+    for qip, item in raw_records.items():
+        ip_type, reason, want_ptr = classify_ip_type(
+            item.get("isp", ""), item.get("org", ""), item.get("asname", ""),
+            flag_hosting=bool(item.get("hosting")), flag_mobile=bool(item.get("mobile")),
+        )
+        preliminary[qip] = (ip_type, reason)
+        if want_ptr:
+            need_ptr.append(qip)
+
+    ptr_map = _resolve_ptr(need_ptr)
+    if need_ptr:
+        print(f"[enrich_ip_info] {len(need_ptr)} 个 IP 关键词无法判定，已 PTR 反查", flush=True)
+
+    new_entries: dict[str, dict[str, Any]] = {}
+    for qip, item in raw_records.items():
+        ptr = ptr_map.get(qip, "")
+        if qip in ptr_map:
+            ip_type, reason, _ = classify_ip_type(
+                item.get("isp", ""), item.get("org", ""), item.get("asname", ""), ptr,
+                flag_hosting=bool(item.get("hosting")), flag_mobile=bool(item.get("mobile")),
+            )
+        else:
+            ip_type, reason = preliminary[qip]
+            if not ptr:
+                reason = reason.replace("待定(需 PTR 反查)",
+                                        "待定(PTR 无结果，按家宽处理)")
+
+        loc = " ".join(part for part in
+                       [item.get("country"), item.get("regionName"), item.get("city")] if part)
+
+        new_entries[qip] = {
+            "owner": item.get("org") or item.get("isp") or "",
+            "asn": item.get("as") or "",
+            "as_name": item.get("asname") or "",
+            "location": loc,
+            "ip_type": ip_type,
+            "quality": ip_type,
+            "ip_reason": reason,
+            "ptr": ptr,
+            # 注意：proxy=true 只代表"这是个 VPN/代理出口"，与家宽/机房无关，
+            # 单独存成一个标记给面板显示，不再参与类型判定。
+            "is_vpn_exit": bool(item.get("proxy")),
+            "cls_ver": _CLS_VER,
+            "cached_at": now,
+        }
 
     if not new_entries:
         return
 
-    # 3. Save cache thread-safely (reload & update to avoid overwrite of concurrent queries)
+    # 4. Save cache thread-safely (reload & update to avoid overwrite of concurrent queries)
     with ip_cache_lock:
         cache = load_ip_cache()
         cache.update(new_entries)
         save_ip_cache(cache)
 
-    # 4. Enrich nodes with newly queried info
+    # 5. Enrich nodes with newly queried info
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host")
         if ip in new_entries:
-            cached = new_entries[ip]
-            node["owner"] = cached.get("owner", "")
-            node["asn"] = cached.get("asn", "")
-            node["as_name"] = cached.get("as_name", "")
-            node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
-            node["quality"] = cached.get("quality", "")
+            _apply_cache_entry(node, new_entries[ip])
 
 
 def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -> tuple[int, str]:
