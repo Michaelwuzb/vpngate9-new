@@ -358,7 +358,21 @@ verify() {
     log "验收（含经代理的真实出口测试）"
     local st; st=$(api /api/status 12)
     if [ -z "$st" ] || ! echo "$st" | grep -q channels; then
-        err "拿不到 /api/status：面板没起来，或 guard_token 不存在（接口需要鉴权）"
+        # 分清「面板真的没起来」和「面板在跑但它是升级前的旧版」——
+        # 旧版没有 guard_token 机制，/api/* 全需鉴权，裸请求必然 401。
+        # 把这种情况报成"面板没起来"会误导人以为服务挂了，其实一切正常。
+        local code
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 \
+               "https://127.0.0.1:${PANEL_PORT}/api/status" 2>/dev/null)
+        { [ -z "$code" ] || [ "$code" = "000" ]; } && code=$(curl -s -o /dev/null -w '%{http_code}' \
+               --max-time 8 "http://127.0.0.1:${PANEL_PORT}/api/status" 2>/dev/null)
+        if [ "$code" = "401" ] && [ ! -s "$INSTALL_DIR/vpngate_data/guard_token" ]; then
+            warn "面板在运行，但它是升级前的旧版 —— 旧版无 guard_token 机制，/api/* 全需鉴权，"
+            warn "因此此处读不到通道表属正常（正式升级后会生成 guard_token，届时才有完整验收）。"
+            warn "旧版机器请直接执行正式升级，而非 --check。"
+            return 0
+        fi
+        err "读不到 /api/status（HTTP ${code:-无响应}）：面板没起来，或已生成的 guard_token 失效"
         return 1
     fi
     echo "$st" | python3 -c '
