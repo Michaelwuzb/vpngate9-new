@@ -28,6 +28,44 @@ bash <(curl -Ls https://raw.githubusercontent.com/Michaelwuzb/vpngate9-new/main/
 
 ---
 
+## 🔄 原地升级（已经装过旧版的机器）
+
+机器上跑着旧版本时**不要删了重装**：代码目录只是个 git 仓库（几 MB），而
+`vpngate_data/` 装的是**运行状态**——通道分配、密码哈希、IP 分类缓存、节点池快照，
+删掉就全要重建。正确做法是原地快进升级：
+
+```bash
+curl -Ls -o ~/vg9-upgrade.sh \
+  https://raw.githubusercontent.com/Michaelwuzb/vpngate9-new/main/vg9_server_upgrade.sh
+bash ~/vg9-upgrade.sh --check     # ① 先体检，零变更
+bash ~/vg9-upgrade.sh             # ② 有差异才动手
+```
+
+- root 直登可直接跑；`debian` 这类**免密 sudo** 的账号也能直接跑，脚本会自动提权重跑
+  （若 sudo 需要密码，就显式 `sudo -n bash ~/vg9-upgrade.sh`）
+- 别用 `bash <(curl -Ls ...)` 的方式：`$0` 会变成 `/dev/fd/63`，非 root 时无法提权重跑。
+  脚本检测到这种情况会给出明确提示。
+
+| 参数 | 行为 |
+|---|---|
+| `--check` | 只体检：比对**代码 / systemd 单元 / `ml` / 登录页 / 旧版策略路由表**五类差异，**零变更** |
+| 无参数 | 五类**全一致时一个字节都不改、也不重启**；有差异才：备份 → 拉代码 → 编译门禁 → 跑测试 → 停服 → 迁移路由表 → 同步仓库外产物 → 启服 → 按**真实出口**验收 |
+| `--skip-tests` | 跳过测试套件（小内存机器省时间） |
+| `--rollback` | 回到上一次备份（代码 + 数据 + systemd 单元 + `ml` + 登录页） |
+
+它会顺手处理 `git pull` **碰不到**的东西：
+
+- **systemd 单元**——新版加了 `network-online`、`StartLimitIntervalSec=0`（允许无限重启）、`LimitNOFILE=65535`
+- **`/usr/bin/ml`**——新版支持 HTTPS 面板与 `guard` 子命令
+- **`vpngate_data/login.html`**——`install.sh` 只在文件不存在时才写，原地升级永远走不到
+- **旧版内核策略路由表 `100~108`**——必须在**服务停止后**清理（否则会打断正在跑的隧道），新版用 `200~208`
+
+> 验收是打**真实流量**（经每条通道的 SOCKS5 出口查实际公网 IP）再和面板标注比对，
+> 不是只看端口有没有在听。注意：VPN Gate 自建的 `219.100.37.x` 节点可能做出站 NAT，
+> 此时"实际出口 IP ≠ 面板标注的节点 IP"属**节点侧行为**，先看该通道实际连的是不是标注的节点再下结论。
+
+---
+
 ## 💡 快速使用
 
 ### 1. 登录管理面板
@@ -380,6 +418,7 @@ ml passwd <新账号> <新密码>      # 账号密码一起改
 ├── speedtest_utils.py     # 测速（SOCKS5 + HTTP 下载，纯标准库）
 ├── vpngate9_guard.py      # 通道守护脚本（install.sh 会自动装成服务）
 ├── install.sh             # 部署脚本
+├── vg9_server_upgrade.sh  # 原地升级脚本（旧版机器升级用，见「原地升级」一节）
 ├── LICENSE                # GPL-3.0 许可证全文
 ├── NOTICE                 # 来源、衍生关系与改造说明
 ├── tests/                 # 测试脚本（逻辑 / 前端 / 端到端，用法见 tests/README.md）
