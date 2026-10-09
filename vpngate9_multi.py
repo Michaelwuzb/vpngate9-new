@@ -3034,8 +3034,6 @@ def main():
             if node:
                 threading.Thread(target=connect_and_track, args=(ch, node), daemon=True).start()
                 time.sleep(2)
-    class DualStackServer(ThreadingHTTPServer):
-        allow_reuse_address = True
     # 面板加密：优先复用机器上已有的证书（s-ui / acme.sh / Let's Encrypt…），
     # 没有才自签。找不到可用的就继续明文 HTTP —— 证书问题绝不能让面板起不来。
     global _ui_tls_info
@@ -3044,19 +3042,50 @@ def main():
         log(f"[UI] https://{UI_HOST}:{UI_PORT}/  {ui_tls.cert_summary(_ui_tls_info)}")
     else:
         log(f"[UI] http://{UI_HOST}:{UI_PORT}/  （明文，未启用 HTTPS）")
+    _ui_ssl_ctx = _ui_tls_info["context"] if _ui_tls_info else None
+
+    class DualStackServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        # 默认 backlog 只有 5，排队一满内核就丢 SYN，表现为"连接超时"，
+        # 很容易被误判成防火墙或证书问题。
+        request_queue_size = 128
+        ssl_context = _ui_ssl_ctx
+        # 单个连接的 TLS 握手最长允许时间。没有它，主线程会被一个连进来
+        # 却不发 ClientHello 的客户端永久拖死（详见 get_request 注释）。
+        handshake_timeout = 20
+
+        def get_request(self):
+            """接一条连接并完成 TLS 握手。
+
+            关键：监听套接字必须保持明文。以前是把加密后的 socket 直接赋给
+            server.socket，于是 socketserver 走到 SSLSocket.accept()，而该函数
+            在 accept 返回的同时就同步执行 do_handshake()。碰上只建 TCP 连接、
+            不发 ClientHello 的客户端（端口扫描器很常见），主线程会永远卡在
+            read()，serve_forever() 再也回不到 accept 循环 —— 面板就此瘫痪，
+            而隧道和采集线程一切照常，从 systemd 状态完全看不出来。
+            """
+            if not self.ssl_context:
+                return self.socket.accept()
+            while True:
+                sock, addr = self.socket.accept()   # 明文 accept，不会被慢客户端卡住
+                try:
+                    sock.settimeout(self.handshake_timeout)
+                    conn = self.ssl_context.wrap_socket(sock, server_side=True)
+                    conn.settimeout(None)            # 握手成功后交还给正常的请求处理
+                    return conn, addr
+                except Exception as e:
+                    # 握手失败或超时：丢掉这条连接，主线程继续服务下一个请求，
+                    # 不能让单个异常连接拖垮整个面板。
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    log(f"[UI] TLS 握手失败({type(e).__name__})，已丢弃 {addr[0]}:{addr[1]}")
+
     try:
         server = DualStackServer((UI_HOST, UI_PORT), Handler)
     except Exception:
         server = DualStackServer(("0.0.0.0", UI_PORT), Handler)
-    if _ui_tls_info:
-        try:
-            # 必须用 wrap_socket 包住监听套接字本身；写在 Handler 里没有
-            # server_side 的上下文，握手阶段就失败了。
-            server.socket = _ui_tls_info["context"].wrap_socket(
-                server.socket, server_side=True)
-        except Exception as e:
-            log(f"[UI] HTTPS 包装失败，退回明文 HTTP: {e}")
-            _ui_tls_info = None
     server.serve_forever()
 
 if __name__ == "__main__":

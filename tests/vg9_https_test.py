@@ -18,7 +18,7 @@
       C1 用生成的上下文包住监听口后，客户端能完成握手并拿到响应
       C2 服务端最低版本 TLS1.2（不吃掉 TLS1.0/1.1）
   [D] 主程序集成
-      D1 启动时先 bind 再 wrap，wrap 失败要退回明文而不是崩
+      D1 握手在 get_request() 里带超时完成，监听口保持明文，慢客户端不会卡死面板
       D2 /api/status 暴露 ui_scheme / ui_tls_source / ui_cert_days
       D3 面板默认就是 HTTPS（不显式关掉的话），关掉才回明文
   [E] 守护脚本协议自适应
@@ -358,14 +358,22 @@ src_multi = open(os.path.join(FIX, "vpngate9_multi.py"), encoding="utf-8").read(
 check("D2 状态接口暴露 ui_scheme / ui_tls_source / ui_cert_days",
       all(k in src_multi for k in ("ui_scheme", "ui_tls_source", "ui_cert_days")))
 
-m_wrap = re.search(r"if _ui_tls_info:\s*\n(\s+)try:\s*\n(.*?)except Exception as e:\s*\n(\s+)log\(f\"\[UI\] HTTPS 包装失败",
-                   src_multi, re.S)
-check("D1a wrap_socket 失败会退回明文而不是让面板起不来", bool(m_wrap))
-m_bind = src_multi.find("server = DualStackServer((UI_HOST, UI_PORT), Handler)")
-m_wrap_at = src_multi.find("server.socket = _ui_tls_info[\"context\"].wrap_socket")
-check("D1b 先 bind 再 wrap（顺序反了就连监听都建不起来）",
-      0 < m_bind < m_wrap_at, f"bind@{m_bind} wrap@{m_wrap_at}")
-check("D1c 面板服务用的是 server_side 上下文包装的监听口",
+# 面板 HTTPS 的握手实现在 2026-10-10 换过：
+#   旧：server.socket = ctx.wrap_socket(server.socket, server_side=True)
+#       问题：SSLSocket.accept() 会在 accept 的同时同步执行握手，碰上只建 TCP 连接、
+#       不发 ClientHello 的客户端（端口扫描器很常见），主线程永久卡在 read()，
+#       serve_forever() 再也回不到 accept 循环 —— 面板彻底瘫痪，而隧道和采集线程
+#       一切照常，从 systemd 状态完全看不出来。
+#   新：监听口保持明文，在 get_request() 里带超时握手，失败就丢掉这条连接。
+check("D1a 面板握手改为 get_request() 内带超时进行，失败丢弃连接不影响其它请求",
+      "def get_request(self)" in src_multi
+      and "handshake_timeout" in src_multi
+      and "ssl_context.wrap_socket(sock, server_side=True)" in src_multi
+      and "sock.close()" in src_multi)
+check("D1b 监听套接字保持明文，不在 accept 阶段同步握手（避免慢客户端卡死主线程）",
+      "server.socket = _ui_tls_info" not in src_multi
+      and "self.socket.accept()" in src_multi)
+check("D1c 面板连接用 server_side 上下文包装",
       'server_side=True' in src_multi)
 
 # 默认应是 HTTPS；只有显式 off 才回明文
