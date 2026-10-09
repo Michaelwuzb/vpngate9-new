@@ -553,6 +553,41 @@ systemctl restart vpngate9-guard
 | `WATCHDOG_INTERVAL` | 15 | 通道巡检间隔（秒） |
 | `FAIL_TOLERANCE` | 3 | 连续 N 轮探测不通才重连（抵消抖动） |
 | `RECONNECT_COOLDOWN` | 90 | 同通道两次重连的最小间隔（秒） |
+| `MAX_RECONNECT_BACKOFF` | 1800 | 通道**指数退避**上限（秒）。连续建隧道失败时冷却时间翻倍：90 → 180 → 360 → … → 封顶 |
+| `NO_NODE_LOG_INTERVAL` | 1800 | "没有可用节点"告警的节流间隔（秒）。否则每 15 秒刷一行，把 journal 刷爆 |
+| `NODE_BLACKLIST_TTL` | 1800 | 连不上的节点首次拉黑时长（秒），重复失败翻倍 |
+| `NODE_BLACKLIST_MAX_TTL` | 43200 | 单个节点拉黑时长上限（秒，12 小时） |
+| `NODE_BLACKLIST_MAX` | 500 | 黑名单最多记录条数（超出后淘汰最早过期的） |
+
+#### 通道一直重连 / 面板看着像"无限重启"？
+
+看门狗最初是**固定 90 秒**重连一次。当某条通道强制了「国家 + IP 类型」，而 VPNGate 上
+这个组合只有一个候选节点、偏偏这个节点已经死了的时候，就会永久地：
+
+```
+[WD CH0] 隧道不通 连续 3 轮，准备重连
+[WD CH0] Reconnect United States residential     <- 又把这个死节点选回来
+[CH0] Starting tun0...                            <- 45 秒后失败
+```
+
+一眼看去像服务崩了在无限重启，其实 `systemctl show michaelvpn -p NRestarts` 是 `0`——
+systemd 一次都没重启过，是看门狗在自己转圈。典型例子：美国节点在 VPNGate 上常年只有
+1 个 Cloudflare WARP，`United States + residential` 根本没有货，只能放宽到机房 IP，
+而这个 IP 的 TCP 端口经常是不通的。
+
+现在做了三件事：
+
+1. **失败节点黑名单**（`vpngate_data/blacklist.json`）：连不上的节点在一段时间内不再被选中，
+   重复失败拉黑越久。这从根上切掉了"每轮都把同一个死节点选回来"。
+2. **通道指数退避**：`RECONNECT_COOLDOWN` 按失败次数翻倍，最多 `MAX_RECONNECT_BACKOFF`。
+3. **告警节流 + 状态可见**：没有可用节点时不再每 15 秒刷日志，改为每 30 分钟一条，
+   同时把原因写进通道 `error`，面板上能直接看到「没有可用的出口节点（United States residential）」。
+
+> 断网时不会误伤：拉黑前会先探测本机出口（1.1.1.1:443 / 8.8.8.8:53），
+> 本机自己都不通就只记日志、不拉黑，免得网络恢复后还要空等黑名单过期。
+>
+> 如果某条通道长期显示"没有可用的出口节点"，说明这个国家在 VPNGate 上确实没有可用节点，
+> 把它改成「自动选择」或换一个国家即可（面板上就能改）。
 
 > 本地 SOCKS 口若开了认证（`LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS`），测速会自动带上同一组凭据，
 > 不需要额外配置。

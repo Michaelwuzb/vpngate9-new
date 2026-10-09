@@ -31,6 +31,9 @@ python tests/vg9_assign_http_test.py
 
 # 7. 面板 HTTPS（证书发现 / 自签 / 端到端 https）+ IP 类型未知值             63 项
 python tests/vg9_https_test.py
+
+# 8. 失败节点黑名单 + 通道指数退避（修"某通道无限重连"）                    24 项
+python tests/vg9_reconnect_blacklist_test.py
 ```
 
 依赖只有 Python 3 标准库和 Node.js（第 3、4 项需要）。Linux 上把 `python` 换成 `python3`。

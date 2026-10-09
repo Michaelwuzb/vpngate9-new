@@ -204,6 +204,17 @@ WATCHDOG_INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", "15"))  # 通道巡�
 FAIL_TOLERANCE = int(os.environ.get("FAIL_TOLERANCE", "3"))         # 连续 N 轮探测不通才重连，抵消抖动
 RECONNECT_COOLDOWN = int(os.environ.get("RECONNECT_COOLDOWN", "90")) # 同通道两次重连最小间隔(秒)
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "45"))      # 单次建隧道等待上限(秒)
+# 看门狗原本是**固定 90 秒**重连一次。遇到"强制国家/类型下只有一个候选节点、而这个节点
+# 恰好是死的"情况（VPNGate 上美国节点常年只有 1 个 Cloudflare WARP，且 TCP 端口不可达），
+# 就会永远 90 秒一次地重连同一个死节点：日志刷屏、openvpn 反复起停，
+# 面板看起来就像"服务在无限重启"（其实 systemd 一次都没重启过）。
+# 现在改成失败次数越多退避越久，并给"没有可用节点"加告警节流。
+MAX_RECONNECT_BACKOFF = int(os.environ.get("MAX_RECONNECT_BACKOFF", "1800"))  # 重连退避上限(秒)
+NO_NODE_LOG_INTERVAL = int(os.environ.get("NO_NODE_LOG_INTERVAL", "1800"))    # "无可用节点"告警节流(秒)
+# 失败节点黑名单：连不上的节点在一段时间内不再被选中。TTL 随失败次数翻倍(上限 12 小时)。
+NODE_BLACKLIST_TTL = int(os.environ.get("NODE_BLACKLIST_TTL", "1800"))        # 首次拉黑时长(秒)
+NODE_BLACKLIST_MAX_TTL = int(os.environ.get("NODE_BLACKLIST_MAX_TTL", "43200"))  # 拉黑时长上限(秒)
+NODE_BLACKLIST_MAX = int(os.environ.get("NODE_BLACKLIST_MAX", "500"))         # 最多记录条数
 
 # 「自动分配出口」默认跳过的国家/地区：VPNGate 上的 CN 节点基本都是境内志愿者家宽，
 # 拿它当境外出口没有意义，而且通常只有 1 个节点、随时掉线。
@@ -270,6 +281,8 @@ class Channel:
         self.last_node_data: dict | None = None  # Save last node for reconnect
         self.fail_streak = 0            # 连续探测失败轮数
         self.last_connect_at = 0.0      # 最近一次发起连接的时间(用于重连冷却)
+        self.connect_fails = 0          # 连续建隧道失败次数（用于指数退避）
+        self.no_node_at = 0.0           # 最近一次"没有可用节点"告警时间（日志节流用）
         # 选节点时立即占位, 这样 9 条通道并发选节点时不会撞同一个出口 IP。
         # 连接成功后清空(此时 node_ip 已生效), 断开/失败也清空。
         self.reserved_ip = ""
@@ -292,6 +305,7 @@ class Channel:
              "node_ip_reason": self.node_ip_reason,
              "node_ip_confidence": self.node_ip_confidence,
              "ip_reused": self.ip_reused, "reserved_ip": self.reserved_ip,
+             "connect_fails": self.connect_fails,
              "node_latency": self.node_latency, "error": self.error,
              "speed_testing": self.speed_testing, "speed_mbps": self.speed_mbps,
              "speed_ttfb_ms": self.speed_ttfb_ms, "speed_at": self.speed_at,
@@ -337,6 +351,128 @@ def save_channels():
             "enabled": ch.enabled,
         }
     write_json(CHANNELS_FILE, data)
+
+# === 失败节点黑名单 ===
+# BLACKLIST_FILE 之前在文件顶部声明了却从没被用过。少了它，"强制某国家"的通道在
+# 该国只有一个候选节点、而这个节点已经死了的时候，每一轮都会把这个死节点选回来：
+#   [WD CH0] Reconnect United States residential -> Starting tun0 -> 失败 -> 90 秒后再来一遍
+# 于是就成了永久重连。这里把它落地：连接失败的节点在一段时间内不参与选择，
+# 且失败次数越多拉黑越久。
+_blacklist: dict[str, dict] = {}     # ip -> {"until": 到期时间戳, "fails": 累计失败次数, "reason": 原因}
+_blacklist_lock = threading.Lock()
+
+
+def load_blacklist() -> None:
+    """从磁盘恢复黑名单（服务重启后不会立刻又去连那些已知死掉的节点）。"""
+    global _blacklist
+    raw = read_json(BLACKLIST_FILE)
+    now = time.time()
+    data: dict[str, dict] = {}
+    if isinstance(raw, dict):
+        for ip, v in raw.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                until = float(v.get("until") or 0)
+            except (TypeError, ValueError):
+                continue
+            if until <= now:            # 已经过期的直接丢弃，不必载入
+                continue
+            try:
+                fails = int(v.get("fails") or 0)
+            except (TypeError, ValueError):
+                fails = 0
+            data[str(ip)] = {"until": until, "fails": fails,
+                             "reason": str(v.get("reason") or "")}
+    with _blacklist_lock:
+        _blacklist = data
+    left = len(data)
+    if left:
+        log(f"[blacklist] 载入 {left} 个失败节点（仍在拉黑期内）")
+
+
+def _save_blacklist() -> None:
+    with _blacklist_lock:
+        payload = dict(_blacklist)
+    try:
+        write_json(BLACKLIST_FILE, payload)
+    except Exception as e:
+        log(f"[blacklist] 保存失败: {e}")
+
+
+def upstream_alive(timeout: float = 3.0) -> bool:
+    """本机到公网是否还通。
+
+    断网时所有隧道都会连不上，那不是节点头上的问题——这时不该把它们全拉黑，
+    否则网络恢复后要等黑名单过期才能重新用上。
+    """
+    for target in (("1.1.1.1", 443), ("8.8.8.8", 53)):
+        s = None
+        try:
+            s = socket.create_connection(target, timeout=timeout)
+            return True
+        except OSError:
+            continue
+        finally:
+            if s is not None:
+                try: s.close()
+                except OSError: pass
+    return False
+
+
+def blacklist_node(ip: str, reason: str = "") -> None:
+    """把连不上的节点拉黑一段时间；重复失败则时长翻倍。"""
+    ip = (ip or "").strip()
+    if not ip:
+        return
+    now = time.time()
+    with _blacklist_lock:
+        rec = _blacklist.get(ip) or {"until": 0.0, "fails": 0, "reason": ""}
+        rec["fails"] = int(rec.get("fails") or 0) + 1
+        ttl = min(NODE_BLACKLIST_TTL * (2 ** min(rec["fails"] - 1, 5)), NODE_BLACKLIST_MAX_TTL)
+        rec["until"] = now + ttl
+        rec["reason"] = (reason or "")[:120]
+        _blacklist[ip] = rec
+        if len(_blacklist) > NODE_BLACKLIST_MAX:      # 防文件无限长：先淘汰最早过期的
+            for k in sorted(_blacklist, key=lambda x: _blacklist[x].get("until", 0))[
+                     :len(_blacklist) - NODE_BLACKLIST_MAX]:
+                _blacklist.pop(k, None)
+        fails = rec["fails"]
+    log(f"[blacklist] {ip} 不可用（第 {fails} 次）：{reason} -> {int(ttl // 60)} 分钟内不再选用")
+    _save_blacklist()
+
+
+def is_blacklisted(ip: str) -> bool:
+    """该 IP 是否还在拉黑期内（顺便清掉已过期的记录）。"""
+    ip = (ip or "").strip()
+    if not ip:
+        return False
+    with _blacklist_lock:
+        rec = _blacklist.get(ip)
+        if not rec:
+            return False
+        if rec.get("until", 0) > time.time():
+            return True
+        _blacklist.pop(ip, None)
+    _save_blacklist()
+    return False
+
+
+def blacklist_size() -> int:
+    with _blacklist_lock:
+        return len(_blacklist)
+
+
+def mark_node_bad(ch: "Channel", reason: str) -> None:
+    """建隧道失败后决定要不要把该节点记进黑名单。
+
+    先确认本机出口本身是通的：断网时 9 条通道会一起失败，那是本机的问题，
+    把 9 个节点全拉黑只会让网络恢复后还要空等一轮黑名单过期。
+    """
+    if upstream_alive():
+        blacklist_node(ch.node_ip, reason)
+    else:
+        log(f"[CH{ch.index}] 本机出口网络不通，暂不把 {ch.node_ip or '当前节点'} 记为坏节点")
 
 # === 新节点标记 ===
 def load_seen_nodes() -> None:
@@ -915,7 +1051,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             release_slot(ch); stop_process(proc); return False
     if not ok:
         stop_process(proc); ch.state = "error"; ch.error = tail[-1][:200] if tail else "timeout"
-        release_slot(ch); return False
+        release_slot(ch); mark_node_bad(ch, "建隧道超时/失败"); return False
     # 隧道连通性实测：TCP 优先（ICMP 常被节点丢弃，ping 会误判成"隧道死了"）
     tunnel_ok = False
     for _try in range(4):
@@ -930,6 +1066,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         ch.error = "tunnel unreachable"
         ch.last_node_data = None
         release_slot(ch)
+        mark_node_bad(ch, "隧道不通")
         return False
 
     # 策略路由必须**先**建好，再对外宣告已连接。
@@ -943,6 +1080,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         ch.state = "error"; ch.error = "policy routing not applied"
         ch.last_node_data = None
         release_slot(ch)
+        mark_node_bad(ch, "策略路由未生效")
         return False
 
     # 代理端口必须真的在听。隧道通了不代表代理可用：端口被占时代理线程早就静默退出了，
@@ -954,6 +1092,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         ch.state = "error"; ch.error = f"proxy port {ch.proxy_port} not listening"
         ch.last_node_data = None
         release_slot(ch)
+        mark_node_bad(ch, f"本地代理端口 {ch.proxy_port} 无响应")
         return False
 
     with ch.lock:
@@ -962,6 +1101,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             ch.last_heartbeat = time.time()
             ch.last_node_data = node
             ch.fail_streak = 0
+            ch.connect_fails = 0     # 连上了，退避计数归零
             ch.reserved_ip = ""   # 预占转正：node_ip 已生效，无需再占位
     log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip} (table {table})")
     return True
@@ -973,7 +1113,7 @@ def disconnect_channel(ch: Channel):
         ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
         ch.node_country = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
         ch.node_ip_reason = ""; ch.node_ip_confidence = ""
-        ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0
+        ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0; ch.connect_fails = 0
         release_slot(ch)
         # Keep config file for watchdog retry
     log(f"[CH{ch.index}] Disconnected")
@@ -1519,8 +1659,13 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
         if not base:
             return None
 
+        def usable(pool: list[dict]) -> list[dict]:
+            # 连不上的节点（黑名单内）不再参与竞争。少了这一步，"强制某国家"的通道在
+            # 该国只剩下一个死节点时，每一轮都会把同一个死节点选回来，退化成无限重连。
+            return [n for n in pool if not is_blacklisted(n.get("ip", ""))]
+
         def choose(pool: list[dict]) -> dict | None:
-            free = [n for n in pool if n.get("ip") not in taken]
+            free = [n for n in usable(pool) if n.get("ip") not in taken]
             if not free:
                 return None
             # 只在最快的前若干节点里随机：既保证链路质量，又让各通道自然分散到不同节点
@@ -1529,12 +1674,20 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
         node = choose(typed) or choose(base)          # 先按 IP 类型，再放宽类型
         reused = False
         if node is None and allow_reuse:
-            pool = typed or base                      # 未占用耗尽 -> 复用
+            pool = usable(typed or base)              # 未占用耗尽 -> 复用（仍然避开黑名单）
             if pool:
                 node = random.choice(pool)
                 reused = True
         if node is None:
             return None
+
+        # 把"指定的 IP 类型其实没有货"明说出来。原实现会静默放宽类型，
+        # 用户看到的是"我要的是住宅 IP，结果出口 IP 是机房"，很难自己想明白。
+        if ip_type and (node.get("ip_type") or "") != ip_type:
+            log(f"[pick] {country or '任意国家'} 没有可用的 "
+                f"{IP_TYPE_LABELS.get(ip_type, ip_type)} 节点，放宽为 "
+                f"{IP_TYPE_LABELS.get(node.get('ip_type') or '', node.get('ip_type') or '未知')}"
+                f" 节点 {node.get('ip', '')}")
 
         if exclude_ch is not None:
             exclude_ch.reserved_ip = node.get("ip", "")
@@ -2726,6 +2879,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok":ok,"channel":ch.to_dict()})
 
 # === Main ===
+def connect_and_track(ch: Channel, node: dict) -> bool:
+    """发起连接并维护通道的失败计数 —— 指数退避就是靠这个计数推出来的。
+
+    启动首连和看门狗重连都走这里，避免两条路径的计数口径不一致
+    （否则开机时连不上不会累计退避，只有看门狗触发的重连才会）。
+    """
+    try:
+        ok = connect_channel(ch, node)
+    except Exception as e:
+        log(f"[CH{ch.index}] connect error: {e}")
+        ok = False
+    with ch.lock:
+        if ok:
+            ch.connect_fails = 0
+        else:
+            ch.connect_fails = getattr(ch, "connect_fails", 0) + 1
+        fails = ch.connect_fails
+    if not ok:
+        cooldown = min(RECONNECT_COOLDOWN * (2 ** min(max(fails - 1, 0), 8)), MAX_RECONNECT_BACKOFF)
+        log(f"[CH{ch.index}] 建隧道失败 {fails} 次，退避 {cooldown} 秒后再试（节点 {node.get('ip', '')}）")
+    return ok
+
+
 def _delayed_connect(ch: Channel, node: dict, delay: float):
     """错峰重连：等待期间若别的路径已经把它连上了，就不要再抢同一个 tun。"""
     try:
@@ -2733,7 +2909,7 @@ def _delayed_connect(ch: Channel, node: dict, delay: float):
         with ch.lock:
             if ch.state == "connecting" or ch.state == "connected":
                 return
-        connect_channel(ch, node)
+        connect_and_track(ch, node)
     except Exception as e:
         log(f"[WD CH{ch.index}] delayed connect error: {e}")
 
@@ -2786,7 +2962,13 @@ def channel_watchdog():
                 with ch.lock:
                     state = ch.state
                 if state in ("disconnected", "error") and force_country and enabled:
-                    if time.time() - last_connect_at < RECONNECT_COOLDOWN:
+                    # 指数退避：连续建隧道失败时把冷却时间翻倍，最多 MAX_RECONNECT_BACKOFF。
+                    # 原来是固定 RECONNECT_COOLDOWN(90s)，节点永远连不上时就变成永久
+                    # 90 秒一次的重连风暴 —— 面板上看着就像"服务在无限重启"。
+                    fails = getattr(ch, "connect_fails", 0)
+                    cooldown = min(RECONNECT_COOLDOWN * (2 ** min(max(fails - 1, 0), 8)),
+                                   MAX_RECONNECT_BACKOFF)
+                    if time.time() - last_connect_at < cooldown:
                         continue
                     # 优先连回同一个节点（出口 IP 不变）
                     node = None
@@ -2806,7 +2988,18 @@ def channel_watchdog():
                         delay = ch.index * 2  # 错峰，避免 9 条隧道同时抢带宽
                         threading.Thread(target=_delayed_connect, args=(ch, node, delay), daemon=True).start()
                     else:
-                        log(f"[WD CH{ch.index}] No node for {force_country} {ch.force_ip_type}")
+                        now = time.time()
+                        # 没有可用节点时每 15 秒打一行日志会刷爆 journal，
+                        # 这里节流到 NO_NODE_LOG_INTERVAL，并把原因写进通道状态给面板看。
+                        if now - getattr(ch, "no_node_at", 0.0) >= NO_NODE_LOG_INTERVAL:
+                            ch.no_node_at = now
+                            log(f"[WD CH{ch.index}] No node for {force_country} {ch.force_ip_type}"
+                                f"：该国家/类型当前没有可用候选节点"
+                                f"（{blacklist_size()} 个失败节点在拉黑中），已退避"
+                                f" {NO_NODE_LOG_INTERVAL // 60} 分钟后复查")
+                        want = f"{force_country} {ch.force_ip_type}".strip()
+                        with ch.lock:
+                            ch.error = f"没有可用的出口节点（{want}）"
             except Exception as e:
                 log(f"[WD CH{ch.index}] Error: {e}")
 
@@ -2816,6 +3009,7 @@ def main():
     migrate_plaintext_credentials()
     GUARD_TOKEN = load_or_create_guard_token()
     load_seen_nodes()   # 必须在采集线程启动前恢复基准，否则重启会把整池节点当成新节点刷一遍
+    load_blacklist()    # 恢复"连不上的节点"名单，重启后不会立刻又去撞同一批死节点
     if is_default_credentials():
         log("[auth] 提醒: 面板仍是默认账号 admin/admin，请登录后点右上角\"管理员\"修改")
     # 清理上次运行残留：只动**本程序启动的** openvpn。
@@ -2852,7 +3046,7 @@ def main():
         if ch.force_country:
             node = get_best_node_for_country(ch.force_country, ch.force_ip_type, exclude_ch=ch)
             if node:
-                threading.Thread(target=connect_channel, args=(ch,node), daemon=True).start()
+                threading.Thread(target=connect_and_track, args=(ch, node), daemon=True).start()
                 time.sleep(2)
     class DualStackServer(ThreadingHTTPServer):
         allow_reuse_address = True
