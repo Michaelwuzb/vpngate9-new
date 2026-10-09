@@ -148,9 +148,14 @@ for ch in chs:
     n = M.get_best_node_for_country(small, "", exclude_ch=ch)
     sips.append(n["ip"] if n else None)
 uniq_s = len(set(i for i in sips if i))
-check(f"IP 数不超过该国节点数（{uniq_s} <= {n_small}）", uniq_s <= n_small, str(sips))
+# 语义已按需求变更：指定国家的未占用节点耗尽后，不再复用同一个 IP、也不返回 None，
+# 而是自动放宽到别的国家挑可用的（"US 没地址了就随便跳个能用的"）。
+# 因此 9 条通道最终应拿到 9 个互不重复的出口 IP。
+check(f"该国节点耗尽后自动放宽到别国，9 个出口 IP 互不重复（{uniq_s}/9）",
+      uniq_s == len(sips) and None not in sips, str(sips))
 if n_small < 9:
-    check("超出部分被标记为复用", sum(1 for c in chs if c.ip_reused) == 9 - n_small,
+    check("不再靠 IP 复用填满（改为放宽到别的国家）",
+          sum(1 for c in chs if c.ip_reused) == 0,
           f"reused={sum(1 for c in chs if c.ip_reused)}")
 small_plan = M.build_assign_plan(fresh_channels(), "country", "")
 check("节点不足时计划里带警告", bool(small_plan["warnings"]) or n_small >= 9,

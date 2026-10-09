@@ -211,10 +211,12 @@ CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "45"))      # 单次建�
 # 现在改成失败次数越多退避越久，并给"没有可用节点"加告警节流。
 MAX_RECONNECT_BACKOFF = int(os.environ.get("MAX_RECONNECT_BACKOFF", "1800"))  # 重连退避上限(秒)
 NO_NODE_LOG_INTERVAL = int(os.environ.get("NO_NODE_LOG_INTERVAL", "1800"))    # "无可用节点"告警节流(秒)
-# 失败节点黑名单：连不上的节点在一段时间内不再被选中。TTL 随失败次数翻倍(上限 12 小时)。
-NODE_BLACKLIST_TTL = int(os.environ.get("NODE_BLACKLIST_TTL", "1800"))        # 首次拉黑时长(秒)
-NODE_BLACKLIST_MAX_TTL = int(os.environ.get("NODE_BLACKLIST_MAX_TTL", "43200"))  # 拉黑时长上限(秒)
-NODE_BLACKLIST_MAX = int(os.environ.get("NODE_BLACKLIST_MAX", "500"))         # 最多记录条数
+# 失败节点"短期跳过"：刚连不上的节点在一小段时间内不再被选中，避免同一轮反复去撞同一个
+# 死节点。**纯内存、不落盘、不随失败次数延长** —— 进程重启即清空，到点自动重新参与选择。
+# （早期版本用的是持久化黑名单 + TTL 翻倍到 12 小时，副作用是名单越积越多，
+#   节点其实早就恢复了，却还因为"仍在拉黑期内"被一直跳过。已按需求废弃该方案。）
+NODE_SKIP_TTL = int(os.environ.get("NODE_SKIP_TTL", "300"))     # 失败节点跳过时长(秒)
+NODE_SKIP_MAX = int(os.environ.get("NODE_SKIP_MAX", "200"))     # 最多记录条数（纯内存，防膨胀）
 
 # 「自动分配出口」默认跳过的国家/地区：VPNGate 上的 CN 节点基本都是境内志愿者家宽，
 # 拿它当境外出口没有意义，而且通常只有 1 个节点、随时掉线。
@@ -236,7 +238,6 @@ NODES_SNAPSHOT_FILE = DATA_DIR / "nodes_snapshot.json"   # 上次成功拉取的
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 CHANNELS_FILE = DATA_DIR / "channels.json"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
-BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 
 # === 新节点标记 ===
 # 一个节点"首现时间"落在 TTL 内就算新节点。用时间戳而不是"本次刷新新增"来判定，
@@ -352,58 +353,23 @@ def save_channels():
         }
     write_json(CHANNELS_FILE, data)
 
-# === 失败节点黑名单 ===
-# BLACKLIST_FILE 之前在文件顶部声明了却从没被用过。少了它，"强制某国家"的通道在
-# 该国只有一个候选节点、而这个节点已经死了的时候，每一轮都会把这个死节点选回来：
-#   [WD CH0] Reconnect United States residential -> Starting tun0 -> 失败 -> 90 秒后再来一遍
-# 于是就成了永久重连。这里把它落地：连接失败的节点在一段时间内不参与选择，
-# 且失败次数越多拉黑越久。
-_blacklist: dict[str, dict] = {}     # ip -> {"until": 到期时间戳, "fails": 累计失败次数, "reason": 原因}
-_blacklist_lock = threading.Lock()
-
-
-def load_blacklist() -> None:
-    """从磁盘恢复黑名单（服务重启后不会立刻又去连那些已知死掉的节点）。"""
-    global _blacklist
-    raw = read_json(BLACKLIST_FILE)
-    now = time.time()
-    data: dict[str, dict] = {}
-    if isinstance(raw, dict):
-        for ip, v in raw.items():
-            if not isinstance(v, dict):
-                continue
-            try:
-                until = float(v.get("until") or 0)
-            except (TypeError, ValueError):
-                continue
-            if until <= now:            # 已经过期的直接丢弃，不必载入
-                continue
-            try:
-                fails = int(v.get("fails") or 0)
-            except (TypeError, ValueError):
-                fails = 0
-            data[str(ip)] = {"until": until, "fails": fails,
-                             "reason": str(v.get("reason") or "")}
-    with _blacklist_lock:
-        _blacklist = data
-    left = len(data)
-    if left:
-        log(f"[blacklist] 载入 {left} 个失败节点（仍在拉黑期内）")
-
-
-def _save_blacklist() -> None:
-    with _blacklist_lock:
-        payload = dict(_blacklist)
-    try:
-        write_json(BLACKLIST_FILE, payload)
-    except Exception as e:
-        log(f"[blacklist] 保存失败: {e}")
+# === 失败节点"短期跳过"（不是黑名单，不落盘）===
+# 需求：某个国家（比如美国）暂时没有可用节点时，**不要死等、也不要把节点永久拉黑**，
+# 直接跳到别的可用节点就行 —— 黑名单越积越多，节点早就恢复了还是用不上。
+# 早期实现是持久化黑名单（TTL 随失败次数翻倍、上限 12 小时），已按需求废弃。
+# 现在只保留"同一轮别反复去撞同一个刚失败的节点"这一件事：
+#   * 纯内存，进程重启即清空，不写任何文件；
+#   * 固定 NODE_SKIP_TTL（默认 5 分钟），到点自动恢复，不翻倍；
+#   * 指定国家没有可用候选时，正确做法是放宽到全池（见 get_best_node_for_country），
+#     而不是把这个国家永久排除。
+_skip_until: dict[str, float] = {}   # ip -> 跳过到期时间戳
+_skip_lock = threading.Lock()
 
 
 def upstream_alive(timeout: float = 3.0) -> bool:
     """本机到公网是否还通。
 
-    断网时所有隧道都会连不上，那不是节点头上的问题——这时不该把它们全拉黑，
+    断网时所有隧道都会连不上，那不是节点头上的问题——这时不该把它们全跳过，
     否则网络恢复后要等黑名单过期才能重新用上。
     """
     for target in (("1.1.1.1", 443), ("8.8.8.8", 53)):
@@ -420,57 +386,54 @@ def upstream_alive(timeout: float = 3.0) -> bool:
     return False
 
 
-def blacklist_node(ip: str, reason: str = "") -> None:
-    """把连不上的节点拉黑一段时间；重复失败则时长翻倍。"""
+def skip_node(ip: str, reason: str = "") -> None:
+    """把一个刚连不上的节点短期跳过（纯内存，不落盘）。
+
+    只做"短时间内别再选它"这一件事。不写文件、不延长、不累积 —— 到点自动恢复，
+    进程重启也直接清空，所以**不会出现"节点早已恢复却还被挡着"**的情况。
+    """
     ip = (ip or "").strip()
     if not ip:
         return
-    now = time.time()
-    with _blacklist_lock:
-        rec = _blacklist.get(ip) or {"until": 0.0, "fails": 0, "reason": ""}
-        rec["fails"] = int(rec.get("fails") or 0) + 1
-        ttl = min(NODE_BLACKLIST_TTL * (2 ** min(rec["fails"] - 1, 5)), NODE_BLACKLIST_MAX_TTL)
-        rec["until"] = now + ttl
-        rec["reason"] = (reason or "")[:120]
-        _blacklist[ip] = rec
-        if len(_blacklist) > NODE_BLACKLIST_MAX:      # 防文件无限长：先淘汰最早过期的
-            for k in sorted(_blacklist, key=lambda x: _blacklist[x].get("until", 0))[
-                     :len(_blacklist) - NODE_BLACKLIST_MAX]:
-                _blacklist.pop(k, None)
-        fails = rec["fails"]
-    log(f"[blacklist] {ip} 不可用（第 {fails} 次）：{reason} -> {int(ttl // 60)} 分钟内不再选用")
-    _save_blacklist()
+    until = time.time() + NODE_SKIP_TTL
+    with _skip_lock:
+        _skip_until[ip] = until
+        if len(_skip_until) > NODE_SKIP_MAX:          # 纯内存也防膨胀：淘汰最早到期的
+            for k in sorted(_skip_until, key=lambda x: _skip_until[x])[
+                     :len(_skip_until) - NODE_SKIP_MAX]:
+                _skip_until.pop(k, None)
+    log(f"[skip] {ip} 暂时不可用（{reason or '连接失败'}），"
+        f"{max(1, NODE_SKIP_TTL // 60)} 分钟内不再优先选用（到期自动恢复）")
 
 
-def is_blacklisted(ip: str) -> bool:
-    """该 IP 是否还在拉黑期内（顺便清掉已过期的记录）。"""
+def is_node_skipped(ip: str) -> bool:
+    """该 IP 是否还在短期跳过期内（顺手清掉已到期的记录）。"""
     ip = (ip or "").strip()
     if not ip:
         return False
-    with _blacklist_lock:
-        rec = _blacklist.get(ip)
-        if not rec:
+    with _skip_lock:
+        until = _skip_until.get(ip)
+        if until is None:
             return False
-        if rec.get("until", 0) > time.time():
+        if until > time.time():
             return True
-        _blacklist.pop(ip, None)
-    _save_blacklist()
+        _skip_until.pop(ip, None)
     return False
 
 
-def blacklist_size() -> int:
-    with _blacklist_lock:
-        return len(_blacklist)
+def skip_count() -> int:
+    with _skip_lock:
+        return len(_skip_until)
 
 
 def mark_node_bad(ch: "Channel", reason: str) -> None:
-    """建隧道失败后决定要不要把该节点记进黑名单。
+    """建隧道失败后，决定要不要把该节点短期跳过。
 
     先确认本机出口本身是通的：断网时 9 条通道会一起失败，那是本机的问题，
-    把 9 个节点全拉黑只会让网络恢复后还要空等一轮黑名单过期。
+    把 9 个节点全跳过只会让网络恢复后还要空等一轮跳过期。
     """
     if upstream_alive():
-        blacklist_node(ch.node_ip, reason)
+        skip_node(ch.node_ip, reason)
     else:
         log(f"[CH{ch.index}] 本机出口网络不通，暂不把 {ch.node_ip or '当前节点'} 记为坏节点")
 
@@ -1650,19 +1613,21 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
 
     选定后立刻写入 exclude_ch.reserved_ip 占位，保证并发场景下 9 条通道各拿一个不同 IP。
     只有该国未占用节点耗尽时才会复用(此时该通道会亮"IP重复"提示)。
+
+    指定国家当前一个可用候选都没有时，会**自动放宽到全池**随便挑一个可用的
+    （不拉黑、不死等），日志会写明"已自动放宽到 XX"。
     """
     with node_pick_lock:
         taken = occupied_ips(exclude_ch)
         if exclude_ips:
             taken |= set(exclude_ips)
         base, typed = _country_candidates(country, ip_type)
-        if not base:
+        if not base and not country:      # 池子本身是空的；指定国家没节点时继续走下面的"放宽"
             return None
 
         def usable(pool: list[dict]) -> list[dict]:
-            # 连不上的节点（黑名单内）不再参与竞争。少了这一步，"强制某国家"的通道在
-            # 该国只剩下一个死节点时，每一轮都会把同一个死节点选回来，退化成无限重连。
-            return [n for n in pool if not is_blacklisted(n.get("ip", ""))]
+            # 刚连不上的节点（短期跳过内）先不选，避免同一轮反复去撞同一个死节点。
+            return [n for n in pool if not is_node_skipped(n.get("ip", ""))]
 
         def choose(pool: list[dict]) -> dict | None:
             free = [n for n in usable(pool) if n.get("ip") not in taken]
@@ -1672,14 +1637,34 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
             return random.choice(free[:min(len(free), 12)])
 
         node = choose(typed) or choose(base)          # 先按 IP 类型，再放宽类型
+        relaxed_from = ""
+        if node is None and country:
+            # 指定的国家当前一个可用候选都没有（比如美国节点掉光了，或仅剩的死节点刚被跳过）。
+            # 按需求**不要死等那一个国家**，直接放宽到全池随便挑个能用的就行。
+            # 仍然排除"自动分配默认不用"的国家（例如境内的 CN），免得"随便跳"反而跳到境内。
+            all_base, all_typed = _country_candidates("", ip_type)
+            all_base = [n for n in all_base if not is_excluded_country(n.get("country_long") or "")]
+            all_typed = [n for n in all_typed if not is_excluded_country(n.get("country_long") or "")]
+            node = choose(all_typed) or choose(all_base)
+            if node is not None:
+                relaxed_from = country
         reused = False
         if node is None and allow_reuse:
-            pool = usable(typed or base)              # 未占用耗尽 -> 复用（仍然避开黑名单）
+            pool = usable(typed or base)              # 未占用耗尽 -> 复用（仍然避开刚失败的节点）
+            if not pool and country:                  # 指定国家实在没货，兜底用全池
+                ab, _ = _country_candidates("", "")
+                pool = usable([n for n in ab
+                               if not is_excluded_country(n.get("country_long") or "")])
             if pool:
                 node = random.choice(pool)
                 reused = True
         if node is None:
             return None
+
+        if relaxed_from:
+            cname = node.get("country_long") or node.get("country") or "其它国家"
+            log(f"[pick] {relaxed_from} 当前没有可用候选节点，"
+                f"已自动放宽到 {cname} 的节点 {node.get('ip', '')}")
 
         # 把"指定的 IP 类型其实没有货"明说出来。原实现会静默放宽类型，
         # 用户看到的是"我要的是住宅 IP，结果出口 IP 是机房"，很难自己想明白。
@@ -2993,9 +2978,9 @@ def channel_watchdog():
                         # 这里节流到 NO_NODE_LOG_INTERVAL，并把原因写进通道状态给面板看。
                         if now - getattr(ch, "no_node_at", 0.0) >= NO_NODE_LOG_INTERVAL:
                             ch.no_node_at = now
-                            log(f"[WD CH{ch.index}] No node for {force_country} {ch.force_ip_type}"
-                                f"：该国家/类型当前没有可用候选节点"
-                                f"（{blacklist_size()} 个失败节点在拉黑中），已退避"
+                            log(f"[WD CH{ch.index}] 全池都没有可用出口节点"
+                                f"（首选 {force_country or '任意国家'} {ch.force_ip_type}，"
+                                f"另有 {skip_count()} 个节点处于短期跳过中），已退避"
                                 f" {NO_NODE_LOG_INTERVAL // 60} 分钟后复查")
                         want = f"{force_country} {ch.force_ip_type}".strip()
                         with ch.lock:
@@ -3009,7 +2994,8 @@ def main():
     migrate_plaintext_credentials()
     GUARD_TOKEN = load_or_create_guard_token()
     load_seen_nodes()   # 必须在采集线程启动前恢复基准，否则重启会把整池节点当成新节点刷一遍
-    load_blacklist()    # 恢复"连不上的节点"名单，重启后不会立刻又去撞同一批死节点
+    # 注意：失败节点只做**进程内**短期跳过，不落盘，所以这里没有"载入名单"这一步
+    # —— 重启后所有节点都重新参与选择（节点可能早就恢复了）。
     if is_default_credentials():
         log("[auth] 提醒: 面板仍是默认账号 admin/admin，请登录后点右上角\"管理员\"修改")
     # 清理上次运行残留：只动**本程序启动的** openvpn。
