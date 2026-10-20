@@ -9,10 +9,14 @@
   [6] build_assign_plan(mode=same, region=...) 的方案与提示文案
   [7] region_supply 会带上 47 个都道府县（0 节点的也列出来）
   [8] 旧节点没有行政区数据时不崩（region 为空）
+  [9] 固定递补顺序：东京都 -> 埼玉 -> 神奈川 -> 千叶 -> 山梨 -> 其它地区
+  [10] 降级后锁定落点：目标县恢复可用也不切回；锁定的县也没货才继续往后
+  [11] 锁定县落盘（重启后仍生效）
 
 用合成数据跑，不依赖外网 —— 行政区判定是纯函数，不该受节点源可用性影响。
 """
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -214,6 +218,82 @@ check("降级说明不会出现空县名", "None" not in " ".join(plan["warnings
 msgs = " ".join(plan["warnings"])
 check("整池没有县数据时说清原因（而不是假装就近算过）",
       "还没有县/州信息" in msgs, msgs[:160])
+
+# ============ [9] 固定递补顺序 ============
+log("\n[9] 东京都没节点：按用户指定的固定顺序退，而不是按直线距离")
+pool = [mk("10.7.0.1", "JP-13"),   # 东京都
+        mk("10.7.1.1", "JP-12"),   # 千叶 ~41km，但排第 4 顺位
+        mk("10.7.2.1", "JP-11"),   # 埼玉 ~29km
+        mk("10.7.3.1", "JP-14"),   # 神奈川 ~28km（直线最近，却排第 3 顺位）
+        mk("10.7.4.1", "JP-19"),   # 山梨 ~100km，但在名单里
+        mk("10.7.5.1", "JP-08"),   # 茨城（关东，不在名单）
+        mk("10.7.6.1", "JP-27")]   # 大阪
+chs = set_pool(pool)
+res = [M.get_best_node_for_country("Japan", "", exclude_ch=ch, region="JP-13") for ch in chs]
+keys = [n["region_key"] for n in res if n]
+check("顺序 = 东京都→埼玉→神奈川→千叶→山梨",
+      keys[:5] == ["JP-13", "JP-11", "JP-14", "JP-12", "JP-19"], str(keys))
+check("名单走完才轮到其它关东县", keys[5] == "JP-08", str(keys))
+check("最后才是其它地区", keys[6] == "JP-27", str(keys))
+tgt13 = M.region_target("Japan", "JP-13")
+check("清单顺位压过直线距离（埼玉 29km 在神奈川 28km 之前）",
+      M.region_rank(pool[2], tgt13)[0] < M.region_rank(pool[3], tgt13)[0],
+      f'{M.region_rank(pool[2], tgt13)} vs {M.region_rank(pool[3], tgt13)}')
+check("不在名单里的关东县档位低于整条名单",
+      M.region_rank(pool[5], tgt13)[0] > M.region_rank(pool[4], tgt13)[0])
+check("固定顺序对外有中文名",
+      G.near_first_names("JP-13") == ["东京都", "埼玉县", "神奈川县", "千叶县", "山梨县"],
+      str(G.near_first_names("JP-13")))
+plan = M.build_assign_plan(chs, "same", "", "Japan", False, "JP-13")
+check("plan 把固定顺序带给面板", (plan.get("region_chain") or [])[:2] == ["东京都", "埼玉县"],
+      str(plan.get("region_chain")))
+check("plan 里第 2 条是埼玉（不是直线更近的神奈川）",
+      [p["region_key"] for p in plan["plan"]][:3] == ["JP-13", "JP-11", "JP-14"],
+      str([p["region_key"] for p in plan["plan"]]))
+
+# ============ [10] 降级后锁定，不切回目标县 ============
+log("\n[10] 已经退到埼玉的通道：东京都恢复可用也不切回")
+pool = [mk(f"10.8.0.{i}", "JP-13") for i in range(1, 6)] + \
+       [mk("10.8.1.1", "JP-11"), mk("10.8.2.1", "JP-14")]
+chs = set_pool(pool)
+ch = chs[0]
+ch.force_country, ch.force_region, ch.region_lock = "Japan", "JP-13", "JP-11"
+n = M.get_best_node_for_country("Japan", "", exclude_ch=ch, region="JP-13")
+check("锁定埼玉时，东京都还有 5 个节点也不回去",
+      (n or {}).get("region_key") == "JP-11", str(n and n.get("region_key")))
+# 让埼玉那个节点被别的通道占掉 -> 锁定的县也没货了
+chs[1].reserved_ip, chs[1].state = "10.8.1.1", "connected"
+n = M.get_best_node_for_country("Japan", "", exclude_ch=ch, region="JP-13")
+check("锁定的县没货 -> 沿固定顺序继续往后（神奈川），不是回东京都",
+      (n or {}).get("region_key") == "JP-14", str(n and n.get("region_key")))
+check("面板上重新指定县（locked='')时不受旧锁定影响",
+      M.get_best_node_for_country("Japan", "", exclude_ch=ch, region="JP-13",
+                                  locked="")["region_key"] == "JP-13")
+check("重新分配也不受旧锁定影响",
+      M.build_assign_plan(
+          [c for c in chs], "same", "", "Japan", False, "JP-13")["plan"][0]["region_key"] == "JP-13")
+
+log("\n[10b] 整条链都没货时，仍然给节点（最后才回到已降级的县）")
+chs = set_pool([mk("10.9.0.1", "JP-13")])
+ch = chs[0]
+ch.force_country, ch.force_region, ch.region_lock = "Japan", "JP-13", "JP-11"
+n = M.get_best_node_for_country("Japan", "", exclude_ch=ch, region="JP-13")
+check("仍返回东京都节点，而不是 None", (n or {}).get("region_key") == "JP-13", str(n))
+check("这时档位是 TIER_AVOID（最后才考虑）",
+      M.region_rank(n, M.region_target("Japan", "JP-13"), "JP-11")[0] == M.TIER_AVOID)
+check("锁定县不在优先链里时降级也不崩",
+      M.region_rank({"region_key": "JP-27", "region": "大阪府", "lat": 34.6, "lon": 135.5},
+                    tgt13, "JP-27")[0] == 0)
+
+# ============ [11] 锁定落盘 ============
+log("\n[11] 锁定县要落盘，重启后依然不切回")
+chs = set_pool(pool)
+ch = chs[3]
+ch.force_country, ch.force_region, ch.region_lock = "Japan", "JP-13", "JP-12"
+M.save_channels()
+saved = json.loads(M.CHANNELS_FILE.read_text(encoding="utf-8"))
+check("channels.json 带 region_lock", saved["3"].get("region_lock") == "JP-12", str(saved.get("3")))
+check("状态接口带 region_lock", ch.to_dict().get("region_lock") == "JP-12")
 
 print(f"\n=== 通过 {PASS} / {PASS + FAIL} ===")
 shutil.rmtree(WORK, ignore_errors=True)

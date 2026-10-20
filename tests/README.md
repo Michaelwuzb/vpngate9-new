@@ -20,7 +20,7 @@ python tests/vg9_assign_test.py
 # 3. 前端 JS 语法 + 函数/元素/onclick 引用完整性（用 node --check）
 python tests/vg9_frontend_check.py
 
-# 4. 前端 DOM stub 单测（node，无需浏览器）                                 40 项
+# 4. 前端 DOM stub 单测（node，无需浏览器）                                 44 项
 node tests/vg9_frontend_test.js
 
 # 5. 端到端：起真实面板实例 + mock VPNGate 节点源                          61 项
@@ -35,10 +35,10 @@ python tests/vg9_https_test.py
 # 8. 失败节点短期跳过 + 国家无货时放宽到全池 + 通道指数退避（修"某通道无限重连"）  26 项
 python tests/vg9_node_pick_test.py
 
-# 9. 精确到县（都道府县）：名称归一 / 同县优先 / 就近降级 / 县供给表          44 项
+# 9. 精确到县（都道府县）：名称归一 / 固定递补顺序 / 就近降级 / 降级后锁定不回切  62 项
 python tests/vg9_region_test.py
 
-# 10. 端到端：/api/regions + auto_assign?region= + 页面县选择器              31 项
+# 10. 端到端：/api/regions + auto_assign?region= + 页面县选择器/顺序提示      38 项
 python tests/vg9_region_http_test.py
 ```
 
@@ -59,3 +59,5 @@ python tests/vg9_region_http_test.py
 - 第 5、6 项只测 HTTP 接口，会显式设 `VPNGATE_UI_TLS=off`（面板现在默认开 HTTPS，
   否则明文请求连不上）；HTTPS 本身由第 7 项覆盖。
 - 第 9 项是纯函数测试，用合成节点（自带经纬度）跑，**不联网**：行政区判定不该受节点源可用性影响。
+- 第 9 项同时覆盖"降级后锁定"：`region_lock` 一旦落下，目标县恢复可用也不会被选回去
+  （只有显式传 `locked=""`、或重新分配时才解除），这是防止出口 IP 反复跳的关键行为。

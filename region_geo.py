@@ -16,8 +16,12 @@ VPNGate 的节点列表里只有国家级（CountryLong=Japan），没有更细�
 
 降级顺序（对应需求"东京都要是没有 IP 可以就近的选用，再没有就往下推"）：
 
-    同县/都道府县  ->  同一大区（如关东）内按距离  ->  全国按距离
-                   ->  全国任意  ->  其它国家（全池）
+    同县/都道府县  ->  用户指定的固定顺序（东京都：埼玉 -> 神奈川 -> 千叶 -> 山梨）
+                   ->  同一大区（如关东）内按距离  ->  全国按距离  ->  全国任意
+                   ->  其它国家（全池）
+
+固定顺序见本文件的 NEAR_FIRST：它是业务偏好，压过"按直线距离"——
+山梨比千叶远，但东京圈用户往往更愿意先拿到山梨而不是跳到别的地区。
 
 距离用节点 IP 的经纬度（ip-api 的 lat/lon）到目标都道府县中心点的球面距离。
 没有经纬度时按"同大区 / 其它"分层，同层内保持原有质量排序。
@@ -100,6 +104,39 @@ _BY_KEY: dict[str, dict[str, Any]] = {p["key"]: p for p in JP_PREFECTURES}
 ZONES: dict[str, list[str]] = {}
 for _p in JP_PREFECTURES:
     ZONES.setdefault(_p["zone"], []).append(_p["key"])
+
+
+# ---------------------------------------------------------------------------
+# 用户点名的"就近顺序"（写死的业务偏好，优先于"按直线距离"）
+# ---------------------------------------------------------------------------
+# 默认降级是"同大区按距离 -> 全国按距离"，但有些目标是用户明确指定了先后次序的：
+# 东京都没节点时先试 埼玉 -> 神奈川 -> 千叶 -> 山梨，而不是按距离先跳到千叶。
+# 因为"直线最近"不等于"线路最合适"：山梨在地理上比千叶远，但常被当成东京圈一部分。
+# 名单走完之后，仍然回到"同大区按距离 -> 全国按距离"继续往下推。
+NEAR_FIRST: dict[str, tuple[str, ...]] = {
+    "JP-13": ("JP-11", "JP-14", "JP-12", "JP-19"),   # 东京都：埼玉 -> 神奈川 -> 千叶 -> 山梨
+}
+
+
+def near_first_chain(key: str) -> list[str]:
+    """目标的完整优先链：[目标本身] + 固定顺序。没有配置时只有目标自己。"""
+    k = (key or "").strip().upper()
+    if not k:
+        return []
+    out = [k]
+    for nk in NEAR_FIRST.get(k, ()):
+        if nk not in out:
+            out.append(nk)
+    return out
+
+
+def near_first_names(key: str) -> list[str]:
+    """优先链对应的中文名，给面板/日志写人话用。"""
+    out = []
+    for k in near_first_chain(key):
+        p = _BY_KEY.get(k)
+        out.append(p["name"] if p else k)
+    return out
 
 
 def _norm(text: str) -> str:

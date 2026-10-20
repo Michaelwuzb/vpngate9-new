@@ -268,6 +268,11 @@ class Channel:
         # 空 = 不限定，整个国家随便挑。留着用户填的原始值（键或名字都行），
         # 每次选节点时再解析，这样面板显示的中文名和内部匹配键不会打架。
         self.force_region = ""
+        # 通道**实际落地**的县键（如 JP-11）。force_region 是"我要哪个县"，
+        # region_lock 是"因为目标县没节点，我已经退到哪个县了"。一旦降级落地，
+        # 重连就锁在这个县，即使原目标县后来又冒出可用 IP 也不切回去
+        # （需求：不要因为东京都恢复就来回折腾出口 IP）。
+        self.region_lock = ""
         self.force_ip_type = ""
         self.enabled = False
         self.state = "disconnected"
@@ -306,6 +311,10 @@ class Channel:
     def to_dict(self) -> dict:
         d = {"index": self.index, "tun": self.tun, "proxy_port": self.proxy_port,
              "force_country": self.force_country, "force_region": self.force_region,
+             "region_lock": self.region_lock,
+             # 中文名一起给出去：面板首屏不用等 /api/regions 就能显示"东京都/埼玉县"
+             "force_region_name": region_display(self.force_region),
+             "region_lock_name": region_display(self.region_lock),
              "force_ip_type": self.force_ip_type, "enabled": self.enabled, "state": self.state,
              "node_id": self.node_id, "node_name": self.node_name, "node_ip": self.node_ip,
              "node_country": self.node_country, "node_region": self.node_region,
@@ -357,6 +366,7 @@ def save_channels():
         data[str(ch.index)] = {
             "force_country": ch.force_country,
             "force_region": ch.force_region,
+            "region_lock": ch.region_lock,
             "force_ip_type": ch.force_ip_type,
             "enabled": ch.enabled,
         }
@@ -1068,6 +1078,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         mark_node_bad(ch, f"本地代理端口 {ch.proxy_port} 无响应")
         return False
 
+    landed = ""
     with ch.lock:
             ch.process = proc
             ch.state = "connected"
@@ -1076,7 +1087,21 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             ch.fail_streak = 0
             ch.connect_fails = 0     # 连上了，退避计数归零
             ch.reserved_ip = ""   # 预占转正：node_ip 已生效，无需再占位
+            # 落地的县写进 region_lock：降级之后就不再回切目标县。
+            # 只有"用户明确指定了县"时才锁 —— 不指定县（整个国家随便挑）的通道
+            # 不该被锁在某个县里，否则可用候选会莫名其妙变少。
+            if ch.force_region and node.get("region_key"):
+                landed = node["region_key"].strip().upper()
+                ch.region_lock = landed
     log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip} (table {table})")
+    if landed:
+        want_key = region_key_of(ch.force_region)
+        if want_key and landed != want_key:
+            pref = region_geo.lookup_prefecture(landed)
+            want = region_geo.lookup_prefecture(want_key)
+            log(f"[CH{ch.index}] 出口落在 {pref['name'] if pref else landed}"
+                f"（{want['name'] if want else want_key} 当前没有可用节点），已锁定该县："
+                f"后续重连不会再切回 {want['name'] if want else want_key}")
     return True
 
 def disconnect_channel(ch: Channel):
@@ -1401,8 +1426,9 @@ def _country_match(n: dict, country: str) -> bool:
 # 做法：
 #   1. vpn_utils 把 ip-api 的 region 归一成 region_key（日本为 JP-13 这种 JIS 码）
 #      + region_zone（关东等大区）+ 经纬度；
-#   2. 这里按 region_rank 分层排序 —— 同县(0) -> 同大区(1, 按距离) ->
-#      全国(2, 按距离) -> 完全没有坐标(3)；
+#   2. 这里按 region_rank 分层排序 —— 目标县(0) -> 用户指定顺序(1..N，如东京都的
+#      埼玉/神奈川/千叶/山梨) -> 同大区(20, 按距离) -> 全国(21, 按距离) ->
+#      没有坐标(22)；已经因降级落地的通道，原目标县被压到 90 档（不回切）；
 #   3. 排序后的第一条可用节点就是"最近的"；同一档且距离相近的几条里随机，
 #      既保持"就近优先"，又不让 9 条通道全挤在同一个节点上。
 # 这样"降级"不是几个 if 堆出来的，而是一条连续的排序链，日志里能说清降到了哪里。
@@ -1440,26 +1466,71 @@ def region_target(country: str, region: str) -> dict | None:
     return tgt
 
 
-def region_rank(node: dict, tgt: dict) -> tuple[int, float]:
+# 档位常量：优先链用 0..N（数字=链上第几位），其余用大一点的固定值，
+# 这样以后往链上插县不用改任何比较代码。
+TIER_ZONE = 20          # 同一大区（关东等），按距离
+TIER_COUNTRY = 21       # 本国其它地区，按距离
+TIER_UNKNOWN = 22       # 双方都没有坐标，只能靠原有质量排序
+TIER_AVOID = 90         # 已经降级落地过：原目标县放到最后，不再切回去
+
+
+def region_rank(node: dict, tgt: dict, locked: str = "") -> tuple[int, float]:
     """节点相对目标行政区的排序键，越小越优先。
 
-    (0, 0)        同县/都道府县
-    (1, 距离)     同一大区（如关东）内，按距离
-    (2, 距离)     其它地区，按距离
-    (3, 0)        双方都没有坐标，只能靠原有质量排序
+    (0, 0)        命中目标县（或已锁定的县 —— 那已经是这条通道当前的"目标"）
+    (1..N, 0)     按固定顺序递补的第 2、3…顺位（日本东京都：埼玉/神奈川/千叶/山梨）
+    (20, 距离)    同一大区（如关东）内，按距离
+    (21, 距离)    其它地区，按距离
+    (22, 0)       双方都没有坐标，只能靠原有质量排序
+    (90, 0)       已降级后要避开的原目标县：只有全日本都没别的可用节点时才回到它
+
+    locked：这条通道**实际落地**的县键。一旦因降级落到别处，就锁在那儿：
+    重连先回这个县，它也没了才按固定顺序往后推，而原来的目标县被压到 90 档
+    —— 这正是"就算东京都又有新 IP 进来，也不切回东京都"的实现。
     """
     nk = (node.get("region_key") or "").strip().upper()
     want = str(tgt.get("key") or "").strip().upper()
-    if want and nk and nk == want:
-        return (0, 0.0)
+    lock = (locked or "").strip().upper()
+    chain = region_geo.near_first_chain(want)
+    avoided: set[str] = set()
+    if lock and lock != want:
+        if lock in chain:
+            idx = chain.index(lock)
+            avoided = set(chain[:idx])      # 锁位之前的（含原目标县）不再主动回切
+            chain = chain[idx:]
+        else:
+            # 链外落点（比如别的国家自定义区、或用户手点过的县）：先留在这个县
+            chain = [lock] + chain
+    if nk and nk in chain:
+        return (chain.index(nk), 0.0)
+    if nk and nk in avoided:
+        return (TIER_AVOID, 0.0)
     dist = region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
                                    node.get("lat"), node.get("lon"))
     zone = node.get("region_zone") or region_geo.zone_of_key(nk)
     if tgt.get("zone") and zone and zone == tgt["zone"]:
-        return (1, dist if dist is not None else 1e6)
+        return (TIER_ZONE, dist if dist is not None else 1e6)
     if dist is not None:
-        return (2, dist)
-    return (3, 0.0)
+        return (TIER_COUNTRY, dist)
+    return (TIER_UNKNOWN, 0.0)
+
+
+def region_key_of(raw: str, country: str = "") -> str:
+    """把面板/配置里的县（键、中文名、日文名、英文名都行）统一成键。"""
+    t = region_geo.resolve_target(raw, country)
+    return (t or {}).get("key", "").upper() if t else ""
+
+
+def region_display(raw: str) -> str:
+    """县键（JP-11）-> 中文名（埼玉县）。认不出来就原样返回。
+
+    to_dict 里带上它，面板首屏就能显示中文名，不用等县级下拉的 /api/regions 回来。
+    """
+    if not raw:
+        return ""
+    pref = region_geo.lookup_prefecture(raw)
+    return pref["name"] if pref else raw
+
 
 
 def _region_gap_text(node: dict, tgt: dict) -> str:
@@ -1498,6 +1569,9 @@ def _region_spill_text(picked: list[tuple[str, dict]], tgt: dict,
         gap = _region_gap_text(first_near, tgt)
         if "约" in gap:
             tail += f"；最近的是 {gap}"      # gap 自己已带括号，这里不要再套一层
+    chain = region_geo.near_first_names(tgt["key"])
+    if len(chain) > 1:
+        tail += f"（固定递补顺序：{' → '.join(chain)} → 其它地区由近到远）"
     return head + tail + "（出口 IP 仍互不重复）"
 
 
@@ -1813,7 +1887,10 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
     return {"plan": plan, "warnings": warnings, "note": note,
             "countries": country_supply(ip_type),
             "regions": region_rows,
-            "region": tgt["name"] if tgt else ""}
+            "region": tgt["name"] if tgt else "",
+            # 固定递补顺序（如 东京都→埼玉→神奈川→千叶→山梨），面板直接照着显示，
+            # 让人一眼看出"没拿到东京都时按什么顺序往下退"。
+            "region_chain": region_geo.near_first_names(tgt["key"]) if tgt else []}
 
 
 
@@ -1831,7 +1908,8 @@ node_pick_lock = threading.Lock()   # "读占用表 + 预占 IP" 必须原子，
 
 def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set = None,
                               exclude_ch: "Channel | None" = None,
-                              allow_reuse: bool = True, region: str = "") -> dict | None:
+                              allow_reuse: bool = True, region: str = "",
+                              locked: str | None = None) -> dict | None:
     """挑一个出口节点，**优先挑没被其它通道占用的 IP**。
 
     选定后立刻写入 exclude_ch.reserved_ip 占位，保证并发场景下 9 条通道各拿一个不同 IP。
@@ -1841,8 +1919,13 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
     （不拉黑、不死等），日志会写明"已自动放宽到 XX"。
 
     region 非空时在这之前还有一层"行政区优先"：先用目标县/都道府县的节点；
-    该县没可用节点就按"同大区 -> 全国由近到远"递补 —— 这就是"东京都没 IP 就
-    就近选、再没有再往下推"。每次降级都会写日志，面板上也能看到落在哪个县。
+    该县没可用节点就按"固定顺序（东京都：埼玉 -> 神奈川 -> 千叶 -> 山梨） ->
+    同大区 -> 全国由近到远"递补 —— 这就是"东京都没 IP 就就近选、再没有再往下推"。
+    每次降级都会写日志，面板上也能看到落在哪个县。
+
+    locked：通道**已经落地锁定的县**（键）。不传则自动取 exclude_ch.region_lock，
+    显式传 "" 表示忽略锁定（面板上重新指定县时就是这种情况）。
+    锁定后重连只在这个县及其之后的顺位里挑，**不会因为原目标县恢复可用就切回去**。
     """
     with node_pick_lock:
         taken = occupied_ips(exclude_ch)
@@ -1852,6 +1935,13 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
         if not base and not country:      # 池子本身是空的；指定国家没节点时继续走下面的"放宽"
             return None
         tgt = region_target(country, region) if region else None
+        if not tgt:
+            lock_key = ""
+        elif locked is None:
+            lock_key = (getattr(exclude_ch, "region_lock", "") or "") if exclude_ch else ""
+        else:
+            lock_key = locked or ""
+        lock_key = lock_key.strip().upper()
 
         def usable(pool: list[dict]) -> list[dict]:
             # 刚连不上的节点（短期跳过内）先不选，避免同一轮反复去撞同一个死节点。
@@ -1869,11 +1959,11 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
             free = [n for n in usable(pool) if n.get("ip") not in taken]
             if not free:
                 return None
-            ranked = sorted(free, key=lambda n: region_rank(n, tgt))
-            best = region_rank(ranked[0], tgt)
+            ranked = sorted(free, key=lambda n: region_rank(n, tgt, lock_key))
+            best = region_rank(ranked[0], tgt, lock_key)
             group = [n for n in ranked[:24]
-                     if region_rank(n, tgt)[0] == best[0]
-                     and abs(region_rank(n, tgt)[1] - best[1]) <= 50]
+                     if region_rank(n, tgt, lock_key)[0] == best[0]
+                     and abs(region_rank(n, tgt, lock_key)[1] - best[1]) <= 50]
             return random.choice(group) if len(group) > 1 else ranked[0]
 
         if tgt:
@@ -1903,7 +1993,7 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
                 if tgt:
                     # 连"复用已占用的 IP"这一步也走就近排序，否则最后几条会随机
                     # 跳到很远的地方，和"就近降级"的承诺不一致。
-                    node = sorted(pool, key=lambda n: region_rank(n, tgt))[0]
+                    node = sorted(pool, key=lambda n: region_rank(n, tgt, lock_key))[0]
                 else:
                     node = random.choice(pool)
                 reused = True
@@ -1911,14 +2001,30 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
             return None
 
         # 行政区降级说明：只有真的没落在目标县时才提示，命中目标县就不刷日志
-        if tgt and not relaxed_from and region_rank(node, tgt)[0] != 0:
+        if tgt and not relaxed_from:
+            rank, _ = region_rank(node, tgt, lock_key)
             who = f"CH{exclude_ch.index}" if exclude_ch is not None else "?"
+            want_name = tgt["name"]
+            if lock_key and lock_key != (tgt.get("key") or "").upper():
+                pref = region_geo.lookup_prefecture(lock_key)   # 锁定的县也没货了
+                want_name = f"{pref['name']}（已锁定的县）" if pref else lock_key
             if not node.get("region"):
-                log(f"[pick {who}] {country} {tgt['name']}：节点还没有县信息可对照，"
+                log(f"[pick {who}] {country} {want_name}：节点还没有县信息可对照，"
                     f"先按质量顺序选了 {node.get('ip', '')}（IP 情报完成后会自动按距离选）")
-            else:
-                log(f"[pick {who}] {country} {tgt['name']} 没有可用节点，"
-                    f"已就近降级到 {_region_gap_text(node, tgt)} 的节点 {node.get('ip', '')}")
+            elif rank == TIER_AVOID:
+                # 锁定县和整条优先链都没货了，只剩"已经降级离开的那个县"
+                log(f"[pick {who}] {country} 除 {node.get('region')} 外已无可用节点，"
+                    f"本次只能回到 {_region_gap_text(node, tgt)} 的节点 {node.get('ip', '')}")
+            elif rank > 0:
+                # 顺位按"原始固定顺序"数（锁定的县会让排序链变短，但人看的还是原顺序）
+                orig = region_geo.near_first_chain((tgt.get("key") or "").upper())
+                nk = (node.get("region_key") or "").upper()
+                if nk and nk in orig:
+                    tail = f"已按固定顺序退到第 {orig.index(nk) + 1} 顺位"
+                else:
+                    tail = "已就近降级到"
+                log(f"[pick {who}] {country} {want_name} 没有可用节点，"
+                    f"{tail} {_region_gap_text(node, tgt)} 的节点 {node.get('ip', '')}")
 
         if relaxed_from:
             cname = node.get("country_long") or node.get("country") or "其它国家"
@@ -2098,6 +2204,7 @@ var CUR_USER="";  // 当前登录账号，由 /api/status 回填，用于管理�
 var _saved={}; // Save dropdown state across renders
 var _CS={},_CTRY=[];  // /api/status 带回的国家供给统计，供"全部通道用同一个国家"使用
 var _REG={};          // {国家: [{key,name,zone,total,free}]} 县级列表缓存（按需拉取）
+var _REGCHAIN={};     // {国家: {县键: [固定递补顺序的中文名]}} 如东京都 -> 埼玉/神奈川/千叶/山梨
 
 // ===== 行政区（县/都道府县/州）=====
 // 只有选定了国家才有意义；日本会返回全部 47 个（含 0 节点的），这样"目标县当前没节点"
@@ -2106,8 +2213,17 @@ function loadRegions(co,cb){
   if(!co){ if(cb)cb([]); return; }
   if(_REG[co]){ if(cb)cb(_REG[co]); return; }
   fetch('/api/regions?country='+encodeURIComponent(co)).then(function(r){return r.json()})
-    .then(function(d){ _REG[co]=(d&&d.regions)||[]; if(cb)cb(_REG[co]); })
+    .then(function(d){
+      _REG[co]=(d&&d.regions)||[];
+      _REGCHAIN[co]=(d&&d.chains)||{};
+      if(cb)cb(_REG[co]);
+    })
     .catch(function(){ _REG[co]=[]; if(cb)cb([]); });
+}
+// 固定递补顺序（目前只有日本东京都配了）："东京都 → 埼玉县 → 神奈川县 → 千叶县 → 山梨县"
+function regionChainText(co,key){
+  var m=_REGCHAIN[co]||{},arr=m[key];
+  return (arr&&arr.length>1)?arr.join(' → '):'';
 }
 function regionNameOf(co,key){
   if(!key) return '';
@@ -2191,13 +2307,22 @@ function render(d){
     h+='<div class="bd"><div class="i"><span class="ll">出口IP</span><span>'+ (c.node_ip||'-') +'</span>'+ dupTag(c,d) +'</div>';
     var ctryShown=c.node_country||c.force_country||'';
     h+='<div class="i"><span class="ll">国家</span><span'+(c.node_country?'':' style="color:#6b7280"')+'>'+ (ctryShown||'-') +'</span></div>';
-    // 县/都道府县：已连接显示节点实际所在县；还没连上时显示"目标县"
+    // 县/都道府县：已连接显示节点实际所在县；还没连上时显示"目标县"。
+    // region_lock 是后端记下的"降级后实际锁定的县"——和 force_region 不同就标"已锁定"，
+    // 让用户知道这条通道不会再因为东京都恢复可用而切回去。
     var regShown=c.node_region||'';
-    var regWant=c.force_region?regionNameOf(c.force_country, c.force_region):'';
+    var regWant=c.force_region?(c.force_region_name||regionNameOf(c.force_country, c.force_region)):'';
+    var regLock=c.region_lock?(c.region_lock_name||regionNameOf(c.force_country, c.region_lock)):'';
+    var regLocked=!!(regLock&&c.force_region&&regLock!==regWant&&c.region_lock!==c.force_region);
     if(regShown||regWant){
       var regTxt=regShown||('<span style="color:#6b7280">目标 '+esc(regWant||c.force_region)+'</span>');
       var regCls=(regWant&&regShown&&regShown!==regWant)?' style="color:#f59e0b"':'';
-      h+='<div class="i"><span class="ll">县/州</span><span class="ow"'+regCls+' title="'+(regWant?'目标：'+esc(regWant):'')+'">'+ regTxt +'</span></div>';
+      var regTip=regWant?('目标：'+regWant):'';
+      if(regLocked){
+        regTxt+='<span style="font-size:10px;color:#f59e0b"> · 已锁定</span>';
+        regTip+='；已按固定顺序退到 '+regLock+'，'+regWant+'恢复可用后也不会切回';
+      }
+      h+='<div class="i"><span class="ll">县/州</span><span class="ow"'+regCls+' title="'+esc(regTip)+'">'+ regTxt +'</span></div>';
     }
     h+='<div class="i"><span class="ll">位置</span><span style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ (c.node_location||'-') +'</span></div>';
     h+='<div class="i"><span class="ll">运营主体</span><span class="ow" title="'+c.node_owner+'">'+ (c.node_owner||'-') +'</span></div>';
@@ -2650,8 +2775,10 @@ function asRegionHint(){
   var rows=_REG[co]||[],row=null;
   for(var i=0;i<rows.length;i++)if(rows[i].key===key)row=rows[i];
   if(!row){el.textContent='';return}
+  var chain=regionChainText(co,key);
   el.innerHTML='该县可用 <b style="color:'+(row.free>=need?'#22c55e':'#f59e0b')+'">'+row.free
-    +'</b> 个'+(row.free>=need?'':('，不够 '+need+' 条：会自动就近递补'));
+    +'</b> 个'+(row.free>=need?'':('，不够 '+need+' 条：会自动就近递补'))
+    +(chain?('<div style="margin-top:2px;color:#6b7280">固定顺序：'+esc(chain)+' → 其它地区由近到远</div>'):'');
 }
 function asModeUI(){
   var m=asMode();
@@ -2715,7 +2842,12 @@ async function previewAssign(){
           near++;
           rcnt[p.region]=(rcnt[p.region]||0)+1;
           var dtxt=(p.distance_km!==null&&p.distance_km!==undefined)?('约 '+Math.round(p.distance_km)+'km'):'就近';
-          rcell='<span style="color:#f59e0b">'+esc(p.region)+'<span style="font-size:10px"> '+dtxt+'</span></span>';
+          // 落在固定顺序上的（第 2/3… 顺位）额外标出来：说明这是"按你指定的次序"退的，
+          // 而不是单纯按直线距离随便挑的
+          var stepTxt='';
+          if(p.region_tier>0&&p.region_tier<20&&d.region_chain&&d.region_chain[p.region_tier])
+            stepTxt='第'+(p.region_tier+1)+'顺位 · ';
+          rcell='<span style="color:#f59e0b">'+esc(p.region)+'<span style="font-size:10px"> '+stepTxt+dtxt+'</span></span>';
         }
       }
       h+='<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 4px">CH'+p.index+'</td><td>'+esc(p.country)+'</td><td>'+rcell+'</td><td>'+esc(p.ip)+'</td><td>'+esc(p.owner||'-')+'</td><td>'+p.country_total+'</td></tr>';
@@ -2728,6 +2860,11 @@ async function previewAssign(){
       var parts=[];
       for(var k2 in rcnt)parts.push(k2+'×'+rcnt[k2]);
       h+='<div style="margin-top:6px;font-size:11px;color:#f59e0b">其中 '+near+' 条未能落在目标县，已就近递补：'+esc(parts.join('、'))+'</div>';
+    }
+    if(d.region_chain&&d.region_chain.length>1){
+      h+='<div style="margin-top:6px;font-size:11px;color:#6b7280">固定递补顺序：'
+        +esc(d.region_chain.join(' → '))+' → 其它地区由近到远；'
+        +'降级后按落点锁定该县，目标县恢复可用也不会切回。</div>';
     }
     if(d.note){
       h+='<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.25);color:#22c55e;font-size:11px;line-height:1.7">'+esc(d.note)+'</div>';
@@ -2987,7 +3124,15 @@ class Handler(BaseHTTPRequestHandler):
                                 "regions": []}, HTTPStatus.BAD_REQUEST)
                 return
             rows = region_supply(country, ip_type)
+            # 固定递补顺序（只有配了 NEAR_FIRST 的县才有，目前是日本东京都），
+            # 面板据此直接写清"没拿到东京都时按 埼玉→神奈川→千叶→山梨 往下退"。
+            chains = {}
+            for r in rows:
+                names = region_geo.near_first_names(r["key"])
+                if len(names) > 1:
+                    chains[r["key"]] = names
             self.send_json({"ok": True, "country": country, "regions": rows,
+                            "chains": chains,
                             "has_presets": bool(region_geo.options_for(country))})
         elif path == "/api/nodes/speedtest":
             # 批量真实测速的完整明细（含每个节点的成功/失败原因）
@@ -3243,13 +3388,17 @@ class Handler(BaseHTTPRequestHandler):
                                 "warnings":res["warnings"], "note":res.get("note",""),
                                 "countries":res["countries"],
                                 "regions":res.get("regions") or [],
+                                "region_chain":res.get("region_chain") or [],
                                 "region":res.get("region") or ""})
                 return
             applied, failed = [], []
             for i, item in enumerate(res["plan"]):
                 ch = channels[item["index"]]
+                # 这是一次"重新分配"，用户明确点了应用：清掉旧的锁定，
+                # 让规划结果（目标县 + 固定顺序）重新生效；连上后会按实际落点重新锁。
+                ch.region_lock = ""
                 node = get_node_by_id(item["node_id"]) or get_best_node_for_country(
-                    item["country"], item["ip_type"], exclude_ch=ch, region=region)
+                    item["country"], item["ip_type"], exclude_ch=ch, region=region, locked="")
                 if not node:
                     failed.append({"index":item["index"], "country":item["country"],
                                    "error":"节点已失效且无备选"})
@@ -3309,16 +3458,21 @@ class Handler(BaseHTTPRequestHandler):
                 if node_iptype: ch.force_ip_type = node_iptype
                 # 手动挑的节点：把它的行政区也记下来，重连时尽量留在同一个县
                 ch.force_region = node.get("region_key") or node.get("region") or ""
+                # 用户亲手点的节点，就是这条通道的"目标"，同步锁上，
+                # 免得看门狗下次重连时按旧的降级顺序飘到别处
+                ch.region_lock = (node.get("region_key") or "").strip().upper()
                 ch.reserved_ip = node.get("ip","")
                 ch.enabled = True
                 save_channels()
             else:
                 node = get_best_node_for_country(country, ip_type, exclude_ch=ch,
-                                                 region=region)
+                                                 region=region, locked="")
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
                 # 显式提交就生效：country 传空表示"自动选择"，即不限国家
                 ch.force_country = country
                 ch.force_region = region
+                # 重新指定过县了，旧的降级锁定作废（连上后按新落点重新锁）
+                ch.region_lock = ""
                 ch.force_ip_type = ip_type
                 ch.enabled = True
                 save_channels()
@@ -3374,6 +3528,7 @@ def channel_watchdog():
                     tun = ch.tun
                     force_country = ch.force_country
                     force_region = ch.force_region
+                    region_lock = ch.region_lock
                     enabled = ch.enabled
                     last_connect_at = ch.last_connect_at
 
@@ -3433,8 +3588,13 @@ def channel_watchdog():
                         node = get_best_node_for_country(force_country, ch.force_ip_type,
                                                          exclude_ch=ch, region=force_region)
                     if node:
+                        # 已锁定县时把锁定点也打出来：一眼能看出"不会再切回目标县"
+                        where = force_region
+                        if region_lock and region_lock != (region_key_of(force_region) or ""):
+                            pref = region_geo.lookup_prefecture(region_lock)
+                            where = f"{force_region}→锁定 {pref['name'] if pref else region_lock}"
                         log(f"[WD CH{ch.index}] Reconnect {force_country} "
-                            f"{force_region} {ch.force_ip_type}".replace("  ", " "))
+                            f"{where} {ch.force_ip_type}".replace("  ", " "))
                         delay = ch.index * 2  # 错峰，避免 9 条隧道同时抢带宽
                         threading.Thread(target=_delayed_connect, args=(ch, node, delay), daemon=True).start()
                     else:
@@ -3478,6 +3638,7 @@ def main():
         c = ch_cfg.get(str(ch.index),{})
         ch.force_country = c.get("force_country","")
         ch.force_region = c.get("force_region","")
+        ch.region_lock = c.get("region_lock","")
         ch.force_ip_type = c.get("force_ip_type","")
         ch.enabled = c.get("enabled", bool(ch.force_country))
     proxy_failures = start_all_proxies()

@@ -181,5 +181,24 @@ check("显示当前正在测的节点", els.job_txt.textContent.indexOf("1.2.3.4
       els.job_txt.textContent);
 check("测速中出现停止按钮", els.btnStop.style.display === "", els.btnStop.style.display);
 
+console.log("\n[10] 固定递补顺序提示（东京都 -> 埼玉 -> 神奈川 -> 千叶 -> 山梨）");
+_REG["Japan"] = [{ key: "JP-13", name: "东京都", zone: "关东", total: 10, free: 2 },
+                 { key: "JP-11", name: "埼玉县", zone: "关东", total: 3, free: 3 }];
+_REGCHAIN["Japan"] = { "JP-13": ["东京都", "埼玉县", "神奈川县", "千叶县", "山梨县"] };
+check("regionChainText 拼出固定顺序",
+      regionChainText("Japan", "JP-13") === "东京都 → 埼玉县 → 神奈川县 → 千叶县 → 山梨县",
+      regionChainText("Japan", "JP-13"));
+check("没配固定顺序的县返回空串", regionChainText("Japan", "JP-11") === "",
+      regionChainText("Japan", "JP-11"));
+CH = new Array(9).fill({});
+els.as_count.value = "";
+els.as_ctry.value = "Japan";
+els.as_region.value = "JP-13";
+asRegionHint();
+check("提示里写明该县不够时会自动递补",
+      els.as_region_hint.innerHTML.indexOf("不够 9 条") >= 0, els.as_region_hint.innerHTML);
+check("提示里带固定顺序（面板能直接看出退到哪）",
+      els.as_region_hint.innerHTML.indexOf("固定顺序") >= 0, els.as_region_hint.innerHTML);
+
 console.log(`\n===== 结果: ${PASS} 通过 / ${FAIL} 失败 =====`);
 process.exit(FAIL ? 1 : 0);

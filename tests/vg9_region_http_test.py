@@ -126,6 +126,10 @@ try:
     by_key = {r["key"]: r for r in rows}
     check("含 JP-13 东京都", by_key.get("JP-13", {}).get("name") == "东京都", str(by_key.get("JP-13")))
     check("东京都带大区=关东", by_key.get("JP-13", {}).get("zone") == "关东")
+    chains = d.get("chains") or {}
+    check("返回东京都的固定递补顺序",
+          chains.get("JP-13") == ["东京都", "埼玉县", "神奈川县", "千叶县", "山梨县"],
+          str(chains.get("JP-13")))
     with_nodes = [r for r in rows if r.get("total", 0) > 0]
     print(f"         有节点的县 {len(with_nodes)} 个；"
           f"东京都 可用 {by_key.get('JP-13', {}).get('free')}/{by_key.get('JP-13', {}).get('total')}")
@@ -156,8 +160,15 @@ try:
               str(len(d.get("regions") or [])))
         have_region_field = all("region" in p for p in plan)
         check("每条方案都带县字段", have_region_field)
+        chain = d.get("region_chain") or []
+        check("预览返回固定递补顺序", chain[:2] == ["东京都", "埼玉县"], str(chain))
         keyed = [p for p in plan if p.get("region_key")]
         if keyed:
+            # 固定顺序：埼玉(1) -> 神奈川(2) -> 千叶(3) -> 山梨(4) 必须按序出现
+            pos = {"JP-11": 1, "JP-14": 2, "JP-12": 3, "JP-19": 4}
+            seq = [pos[p["region_key"]] for p in keyed if p["region_key"] in pos]
+            check("固定顺序的落点按 埼玉→神奈川→千叶→山梨 依次出现",
+                  seq == sorted(seq), str(seq))
             tokyo = [p for p in keyed if p["region_key"] == "JP-13"]
             check("优先落在东京都（至少有命中）", len(tokyo) >= 1,
                   str([p.get("region") for p in plan]))
@@ -189,11 +200,19 @@ try:
         check("force_region 已写入", ch.get("force_region") == "JP-13",
               str(ch.get("force_region")))
 
+    print("\n[6b] 通道状态带 region_lock（降级锁定落点）")
+    code, txt = call("GET", "/api/status")
+    st = json.loads(txt) if code == 200 else {}
+    chs = st.get("channels") or []
+    check("通道列表带 region_lock 字段",
+          bool(chs) and all("region_lock" in c for c in chs), f"len={len(chs)}")
+
     print("\n[7] 页面元素")
     code, html = call("GET", "/")
     for token in ("精确到县", "id=\"as_region\"", "id=\"f_region\"", "function fillAsRegions",
                   "function loadRegions", "function fillRegionSel", "县/州",
-                  "function asRegionHint", "region_tier"):
+                  "function asRegionHint", "region_tier", "已锁定",
+                  "function regionChainText", "固定递补顺序"):
         check(f"页面含 {token}", token in html)
 
     scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
