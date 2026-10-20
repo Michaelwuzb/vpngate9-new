@@ -250,6 +250,18 @@ try:
     d4 = json.loads(txt)
     check("单通道连接接口可用", code == 200 and "channel" in d4, txt[:160])
 
+    # 回归线索：这里曾经用 occupied_ips()（set）下标取通道号，一旦真撞上
+    # "同一节点被两条通道选中"就抛 'set' object is not subscriptable。
+    # 该行为的单元测试放在 vg9_stability_test.py（本文件跑在子进程里、
+    # 没有 openvpn，连不上就释放预占，构造不出稳定冲突）。
+    nid = (d4.get("channel") or {}).get("node_id") or ""
+    check("连接结果带回 node_id", bool(nid), txt[:160])
+    if nid:
+        # 重连到自己正在用的节点不该被当成"被占用"
+        code, txt = call("POST", "/api/channel/0/connect?node_id=" + urllib.parse.quote(nid),
+                         cookie=cookie)
+        check("通道连回自己的节点不判冲突", code == 200, f"code={code} {txt[:160]}")
+
     print("\n[9] 前端页面与 JS")
     code, html = call("GET", "/", cookie=cookie)      # 登录后再取页面
     open(os.path.join(WORK, "index.html"), "w", encoding="utf-8").write(html)

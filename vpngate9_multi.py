@@ -1448,6 +1448,16 @@ def occupied_ips(exclude_ch: "Channel | None" = None) -> set[str]:
             if exclude_ch is None or idx != exclude_ch.index}
 
 
+def occupied_index(exclude_ch: "Channel | None" = None) -> dict[str, int]:
+    """{出口 IP: 通道号}，可排除本通道 —— 用来回答"这个出口被哪条通道占了"。
+
+    注意别拿 `occupied_ips()` 去做这件事：它返回的是 **set**，
+    写 `dup[ip]` 取通道号会直接抛 `'set' object is not subscriptable`。
+    """
+    return {ip: idx for ip, idx in occupied_map().items()
+            if exclude_ch is None or idx != exclude_ch.index}
+
+
 def country_supply(ip_type: str = "") -> dict[str, dict[str, int]]:
     """各国节点供给统计，用于面板提示"这个国家还剩多少可用 IP"。
 
@@ -4070,7 +4080,9 @@ class Handler(BaseHTTPRequestHandler):
             if node_id:
                 node = get_node_by_id(node_id)
                 if not node: self.send_json({"error":"node not found"}, HTTPStatus.NOT_FOUND); return
-                dup = occupied_ips(ch)
+                # occupied_index() 是 {IP: 通道号}；这里要排除本通道自己，
+                # 否则"重连到自己正在用的节点"会被误判成被占用。
+                dup = occupied_index(ch)
                 if node.get("ip","") in dup:
                     self.send_json({"ok":False,"error":"该节点出口 IP 已被 CH%d 占用" % dup[node["ip"]]},
                                    HTTPStatus.CONFLICT)
@@ -4200,7 +4212,9 @@ def channel_watchdog():
                     # 优先连回同一个节点（出口 IP 不变）
                     node = None
                     last = ch.last_node_data
-                    dup = occupied_ips(ch)
+                    # 用带通道号的视图：日志里要写出"被哪条通道占了"，
+                    # 拿 set 去下标会抛 'set' object is not subscriptable（见 occupied_index 注释）
+                    dup = occupied_index(ch)
                     tk = type_key(ch.force_ip_type)
                     if last and last.get("config_text"):
                         if last.get("ip","") in dup:

@@ -374,5 +374,37 @@ check("G2 ml 的卸载分支也清理路由",
       sh.count("ip rule del table") >= 2 and "ip route flush table" in sh)
 check("G3 默认仓库指向 vpngate9-new", 'REPO_NAME="${2:-vpngate9-new}"' in sh)
 
+# ============================================================ H 占用索引
+head("H. 「这出口被哪条通道占着」的索引（回归：set 下标崩）")
+
+# 历史 bug：occupied_ips() 返回 set[str]，看门狗和手动连接两处却写 dup[ip] 取通道号，
+# 真撞上"同一节点被两条通道选中"就抛 'set' object is not subscriptable ——
+# 接口 500、看门狗每轮刷 Error、通道永远连不上。所以索引必须带通道号。
+_c0, _c1 = M.channels[0], M.channels[1]
+_old0 = (_c0.reserved_ip, _c0.state, _c0.node_ip)
+_old1 = (_c1.reserved_ip, _c1.state, _c1.node_ip)
+try:
+    _c0.reserved_ip = "203.0.113.9"
+    _c0.state = "connecting"
+    _c0.node_ip = ""
+    _c1.reserved_ip = ""
+    _c1.node_ip = "198.51.100.7"
+    _c1.state = "connected"
+
+    idx = M.occupied_index()
+    check("H1 返回 {IP: 通道号}，不是 set", isinstance(idx, dict))
+    check("H2 能查到占用者通道号", idx.get("203.0.113.9") == _c0.index, str(idx))
+    check("H3 连 reserved/connecting 的预占也算在内", idx.get("198.51.100.7") == _c1.index, str(idx))
+    check("H4 排除自己后不再出现", "203.0.113.9" not in M.occupied_index(_c0))
+    check("H5 被占用时能取到是谁 —— 旧写法在这里会抛 TypeError",
+          M.occupied_index(_c1).get("203.0.113.9") == _c0.index)
+    # 这两处都要用带通道号的视图；用 set 再下标就是老 bug
+    check("H6 两处占用判断都改用 occupied_index()",
+          src_multi.count("dup = occupied_index(") == 2
+          and "dup = occupied_ips(" not in src_multi)
+finally:
+    _c0.reserved_ip, _c0.state, _c0.node_ip = _old0
+    _c1.reserved_ip, _c1.state, _c1.node_ip = _old1
+
 print(f"\n===== 结果: {PASS} 通过 / {FAIL} 失败 =====")
 sys.exit(1 if FAIL else 0)
