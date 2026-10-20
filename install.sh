@@ -207,6 +207,10 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=/opt/michaelvpn
+# 只在"假连接/连不上"时动手，不主动轮换出口 IP。
+# 早期默认每 30 轮（≈30 分钟）把所有通道的 IP 换一遍，会打乱已经稳定分配好的
+# 住宅 IP，也让锁定在某县的通道被迫重选。确实想要主动换 IP 就改成 30。
+Environment=VPNGATE_ROTATE_EVERY=0
 ExecStart=/usr/bin/python3 /opt/michaelvpn/vpngate9_guard.py
 Restart=always
 RestartSec=10
@@ -296,6 +300,33 @@ SYSCTLEOF
     echo -e "${GREEN}  OK${NC}"
 }
 
+# === 只补装/更新守护服务 ===
+# 老版本 install.sh 还不带 guard 单元，那些机器用升级脚本升上来就会一直是
+# "未安装"；但是为了一个 systemd 单元重跑整套安装（会重装依赖、重拉代码）并不合适。
+# 这个入口只写单元 + 起服务，其它什么都不碰。
+if [ "${1:-}" = "--guard-only" ] || [ "${1:-}" = "guard-only" ]; then
+    echo -e "${CYAN}补装守护服务 ${GUARD_SERVICE}${NC}"
+    if [ ! -f "$INSTALL_DIR/vpngate9_guard.py" ]; then
+        echo -e "${RED}找不到 $INSTALL_DIR/vpngate9_guard.py —— 请先完整安装一次${NC}"
+        exit 1
+    fi
+    if [ "${ML_NO_GUARD:-0}" = "1" ]; then
+        echo -e "${YELLOW}ML_NO_GUARD=1，跳过守护服务${NC}"
+        exit 0
+    fi
+    install_guard_service
+    systemctl restart ${GUARD_SERVICE} 2>/dev/null || systemctl start ${GUARD_SERVICE} 2>/dev/null || true
+    sleep 2
+    if systemctl is-active ${GUARD_SERVICE} &>/dev/null; then
+        echo -e "${GREEN}守护已运行${NC}（假连接自动换节点；不主动轮换出口 IP）"
+        echo -e "  日志: ${CYAN}journalctl -u ${GUARD_SERVICE} -f${NC}  或  ${CYAN}ml guardlogs${NC}"
+    else
+        echo -e "${YELLOW}守护未启动，查: journalctl -u ${GUARD_SERVICE} -n 30 --no-pager${NC}"
+        exit 1
+    fi
+    exit 0
+fi
+
 echo -e "${CYAN}============================"
 echo "  MichaelVPN 9-Channel 部署"
 echo "============================${NC}"
@@ -341,7 +372,7 @@ if [ "${ML_NO_GUARD:-0}" = "1" ]; then
     echo -e "  守护:      ${YELLOW}未安装 (ML_NO_GUARD=1)${NC}"
 else
     systemctl is-active ${GUARD_SERVICE} &>/dev/null \
-        && echo -e "  守护:      ${GREEN}已运行${NC} (假连接自动换节点)" \
+        && echo -e "  守护:      ${GREEN}已运行${NC} (假连接自动换节点，不主动轮换 IP)" \
         || echo -e "  守护:      ${YELLOW}已安装但未运行, 查: ml guard${NC}"
 fi
 echo -e "  卸载:      ${CYAN}ml uninstall${NC}"

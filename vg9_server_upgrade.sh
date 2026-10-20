@@ -442,7 +442,9 @@ print("    真实出口与面板标注一致: %d 条 / 异常 %d 条" % (agree, 
     if [ -f "/lib/systemd/system/$GUARD_SERVICE.service" ] || [ -f "/etc/systemd/system/$GUARD_SERVICE.service" ]; then
         gstate=$(systemctl is-active "$GUARD_SERVICE" 2>/dev/null || echo 已停止)
     else
-        gstate="未安装（新安装脚本会默认装上；可手动启用或忽略）"
+        # 老机器（旧版 install.sh 装的）没有这个单元，升级脚本只换代码不动 systemd，
+        # 所以这里会一直显示"未安装"——不是故障，补装也不该重跑整套安装。
+        gstate="未安装（补装: cd $INSTALL_DIR && bash install.sh --guard-only）"
     fi
     fmt "守护 $GUARD_SERVICE:" "$gstate"
     fmt "工作区改动:"       "$(cd "$INSTALL_DIR" && git status --short | wc -l) 个（应为 0）"

@@ -49,6 +49,9 @@ python tests/vg9_host_guard_test.py
 
 # 13. 证书热重载：真握手比对指纹 / 半截 PEM 不炸 / 后台线程自己发现变更     17 项
 python tests/vg9_cert_reload_test.py
+
+# 14. 守护默认不轮换 IP：环境变量脏值兜底 / unit 里显式关掉 / --guard-only 补装   23 项
+python tests/vg9_guard_test.py
 ```
 
 依赖只有 Python 3 标准库和 Node.js（第 3、4 项需要）。Linux 上把 `python` 换成 `python3`。

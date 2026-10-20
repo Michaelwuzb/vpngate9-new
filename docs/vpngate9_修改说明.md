@@ -1319,3 +1319,78 @@ do_GET、do_POST 都接了检查，且排在鉴权之前
 ```
 
 全量回归：49+36+66+27+77+51+28+43+68+44+47+49 + 前端校验，全绿。
+
+---
+
+## 二十三、守护服务统一：默认不主动轮换 IP + 老机器一键补装
+
+### 23.1 现象：三台机器只有一台有守护
+
+三台跑同一个提交，升级报告里却只有一台显示 `守护 vpngate9-guard: active`，另外两台
+显示「未安装」。原因不是升级失败：
+
+- `vpngate9-guard.service` 是**后期才加进 `install.sh`** 的；
+- `vg9_server_upgrade.sh` 只负责换代码 + 重启服务，**从来不碰 systemd 单元**；
+- 那两台是最早用旧版 `install.sh` 装的，所以这个单元从来没被创建过。
+
+换句话说：守护是"新装才有、升级不会补"的东西。通道本身、面板、代理口都不受影响，
+面板内置的 watchdog 仍然负责掉线重连。
+
+### 23.2 顺带改掉一个默认行为：不再每 30 分钟换一遍 IP
+
+`ROTATE_EVERY` 原来写死 30，配合 `CHECK_EVERY=60` 就是**每 30 分钟把全部通道的出口 IP
+换一轮**。在 181.33 上实测到了这个过程：
+
+```
+17:05:28 CH0 FIX (scheduled rotate) -> Japan / residential
+17:05:36 CH1 FIX (scheduled rotate) -> Japan / residential
+...
+17:06:44 CH6 重连未成功: ... 'error': 'AUTH_FAILED'
+```
+
+9 条全换，其中 3 条还撞上 `AUTH_FAILED` 要重试。后果是：已经稳定跑着的住宅 IP 被无谓
+打乱，"锁定在某县"的通道被强行重选，跟"分配好就别乱动"的预期是冲突的。
+
+改法：`ROTATE_EVERY = _env_int("VPNGATE_ROTATE_EVERY", 0)`
+
+- 默认 `0` = 只在假连接/连不上时动手，不主动换 IP；
+- 想恢复轮换：systemd 里 `Environment=VPNGATE_ROTATE_EVERY=30`；
+- 值写错（空、`abc`、`-5`）一律安全回落到 0 —— systemd 里手滑不该让守护起不来；
+- 判定表达式保留了 `ROTATE_EVERY > 0 and ...` 的短路，`0` 时不会去算 `% 0`。
+
+`install.sh` 写出的 unit 里也显式带上 `Environment=VPNGATE_ROTATE_EVERY=0`，
+免得"代码默认 0、unit 却按老习惯传 30"这种不一致。
+
+### 23.3 老机器补装：`install.sh --guard-only`
+
+为一个 systemd 单元重跑整套安装（装依赖、重拉代码）不合适，所以加了单独入口：
+
+```bash
+cd /opt/michaelvpn && bash install.sh --guard-only
+```
+
+只做四件事：写单元 → `daemon-reload` → `enable` → `restart`，然后退出。
+不调用 `install_deps` / `deploy_code`，不碰 `vpngate_data`，可以反复执行。
+找不到 `vpngate9_guard.py` 时直接 `exit 1` 并提示先完整安装，不会假装成功。
+
+升级报告里的提示也从含糊的「新安装脚本会默认装上；可手动启用或忽略」
+改成可复制的命令：
+
+```
+守护 vpngate9-guard: 未安装（补装: cd /opt/michaelvpn && bash install.sh --guard-only）
+```
+
+### 23.4 验证
+
+新增 `tests/vg9_guard_test.py`（23 项）。其中"默认值"和"环境变量"两组不是 grep 源码，
+而是**起子进程 import 模块**，直接比对进程最终看到的 `ROTATE_EVERY`：
+
+```
+不设环境变量   -> 0
+=30            -> 30        （想开的人能开回来）
+=0 / 空 / abc / -5 / " 7 " -> 0 / 0 / 0 / 0 / 7
+do_rotate 表达式            -> ROTATE_EVERY=0 时 False 且不抛 ZeroDivisionError
+```
+
+另外覆盖：unit 里确实带 `Environment=...=0`、`--guard-only` 分支不调用
+`install_deps`/`deploy_code`/不碰 `vpngate_data`、缺文件时 `exit 1`、升级提示带可执行命令。

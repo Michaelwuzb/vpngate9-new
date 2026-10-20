@@ -665,12 +665,22 @@ cp vpngate9_guard.py /opt/michaelvpn/vpngate9_guard.py
 systemctl restart vpngate9-guard
 ```
 
+**老机器补装**（早期 `install.sh` 不带这个单元，升级脚本只换代码、不动 systemd，
+所以升级报告里会显示"未安装"——不是故障）：
+
+```bash
+cd /opt/michaelvpn && bash install.sh --guard-only
+```
+
+只写这一个 systemd 单元并启动，不重装依赖、不重拉代码、不碰 `vpngate_data`，
+可以随便重跑（幂等）。想停掉：`systemctl disable --now vpngate9-guard`。
+
 ### 行为说明
 
 - 每 60 秒检查一轮 9 通道
 - **假连接检测**：面板显示 `connected` 但 SOCKS5 实测拿不到出口 IP → 连续 2 轮都拿不到才换节点（避免网络抖动误伤）
 - **每个通道沿用它在面板里设置的国家 / IP类型**，不再统一改成日本（旧版本硬编码了 `country=Japan&ip_type=residential`，会把 9 条通道的出口全变成日本）
-- **掉线（state != connected）默认交给面板内置 watchdog 处理**，守护脚本只管"假连接"和定时轮换 —— 两条链路各管一段，不会同时去抢同一个 tun。如果你的面板 watchdog 被关掉了，把脚本顶部的 `HANDLE_DISCONNECTED` 改成 `True`
+- **掉线（state != connected）默认交给面板内置 watchdog 处理**，守护脚本只管"假连接"（定时轮换默认已关闭）—— 两条链路各管一段，不会同时去抢同一个 tun。如果你的面板 watchdog 被关掉了，把脚本顶部的 `HANDLE_DISCONNECTED` 改成 `True`
 - **手动关闭的通道（面板卡片上的"守护自动重连"勾掉，即 enabled=False）不会被动重连**
 - **认证走面板生成的守护令牌** `/opt/michaelvpn/vpngate_data/guard_token`（面板启动时自动生成，权限 600）。
   所以**面板里改账号密码、清会话，都不会让守护失联**（旧版读 ui_auth.json 明文，改密后要同步改脚本）
@@ -690,9 +700,19 @@ systemctl restart vpngate9-guard
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `CHECK_EVERY` | 60 | 检查间隔（秒） |
-| `ROTATE_EVERY` | 30 | 每 N 轮主动换节点切 IP（0=不主动切） |
+| `VPNGATE_ROTATE_EVERY` | **0** | 每 N 轮主动换节点切 IP；**0 = 不主动切**（见下） |
 | `FAIL_TOLERANCE` | 2 | 连续 N 轮测不到流量才判定假连接 |
 | `RECONNECT_COOLDOWN` | 120 | 同通道两次重连最小间隔（秒） |
+
+> **关于主动轮换**：早期版本默认 30，也就是每 30 分钟把 9 条通道的出口 IP 全换一遍。
+> 这会打乱已经稳定跑着的住宅 IP，也让"锁定在某县"的通道被迫重选，所以默认改成了 `0`。
+> 确实想定时换 IP，在 systemd 单元里改回来：
+> ```bash
+> sed -i 's/Environment=VPNGATE_ROTATE_EVERY=0/Environment=VPNGATE_ROTATE_EVERY=30/' \
+>     /lib/systemd/system/vpngate9-guard.service
+> systemctl daemon-reload && systemctl restart vpngate9-guard
+> ```
+> 值写错（空/非数字/负数）会安全回落到 0，不会让守护起不来。
 | `HANDLE_DISCONNECTED` | False | 是否连"掉线"也由本脚本重连 |
 | `PANEL` | 自动探测 | 面板地址。留空时自动在 `https://127.0.0.1:8787` 和 `http://127.0.0.1:8787` 之间试 |
 | `GUARD_TOKEN_FILE` | `/opt/michaelvpn/vpngate_data/guard_token` | 守护令牌（环境变量 `VPNGATE_GUARD_TOKEN_FILE`） |

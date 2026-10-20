@@ -40,8 +40,25 @@ AUTH_FILE = os.environ.get("VPNGATE_UI_AUTH", "/opt/michaelvpn/vpngate_data/ui_a
 GUARD_TOKEN_FILE = os.environ.get("VPNGATE_GUARD_TOKEN_FILE", "/opt/michaelvpn/vpngate_data/guard_token")
 NUM_CHANNELS = 9            # 已废弃：通道数一律以面板 /api/status 为准（保留仅为兼容旧文档）
 PROXY_BASE_PORT = 47928     # 仅当面板是老版本、不返回 proxy_port 时的兜底推算基准
+def _env_int(name: str, default: int) -> int:
+    """读一个非负整数环境变量。空/非数字/负数一律回落到默认值 ——
+    systemd 里写错一个字符不该让守护起不来。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val >= 0 else default
+
+
 CHECK_EVERY = 60            # 每 60 秒检查一轮
-ROTATE_EVERY = 30           # 每 30 轮主动换节点切 IP (0=不主动切)
+# 定时主动轮换出口 IP：默认 0 = 不主动换。
+# 这里改过默认值：早期版本是 30（每 30 轮≈30 分钟把全部通道换一遍），
+# 会把已经稳定用着的住宅 IP 全部打乱，也让"锁定在某县"的通道被迫重选。
+# 想恢复主动轮换：systemd 里加 Environment=VPNGATE_ROTATE_EVERY=30
+ROTATE_EVERY = _env_int("VPNGATE_ROTATE_EVERY", 0)
 FAIL_TOLERANCE = 2          # 连续 N 轮 SOCKS 测不出流量才判定假连接
 RECONNECT_COOLDOWN = 120    # 同一通道两次重连的最小间隔(秒), 防止反复抖动
 SOCKS_TEST_URL = "http://api.ipify.org"
