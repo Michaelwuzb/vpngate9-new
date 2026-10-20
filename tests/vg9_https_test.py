@@ -623,6 +623,17 @@ M.nodes_cache.clear()
 check("F6e '当前没有该类型节点' 的提示用中文而不是 unknown",
       "「{ip_type_label(tk)}」类型的节点" in src_multi)
 
+# 面板页面自带全部前端代码：升级后如果浏览器还能拿旧缓存，"新加的下拉看不见"，
+# 用户只能自己强刷 —— 服务端必须显式禁止缓存（HTML 与 JSON 都要）。
+check("F6f 面板 HTML 明确禁止浏览器缓存（no-store）",
+      src_multi.count('self.send_header("Cache-Control","no-store, must-revalidate")') >= 2,
+      str(src_multi.count('self.send_header("Cache-Control","no-store, must-revalidate")')))
+check("F6g JSON 接口同样 no-store（通道状态/县列表必须是实时的）",
+      'self.send_header("Cache-Control","no-store, must-revalidate")' in
+      src_multi.split("def send_json")[1].split("def log_message")[0])
+check("F6h 顺手带 Pragma: no-cache（老浏览器/代理也认）",
+      src_multi.count('"Pragma","no-cache"') >= 2)
+
 # ============================================================ G 安装脚本
 head("G. 安装脚本")
 

@@ -3325,6 +3325,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type","application/json; charset=utf-8")
+        # 面板数据必须实时：不许浏览器/中间层缓存，否则通道状态、县列表会显示成旧的
+        self.send_header("Cache-Control","no-store, must-revalidate")
         self.send_header("Content-Length",str(len(body)))
         self.end_headers(); self.wfile.write(body)
 
@@ -3372,6 +3374,10 @@ class Handler(BaseHTTPRequestHandler):
                                    .replace("${error_text}", err_text).encode()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type","text/html; charset=utf-8")
+            # 页面内嵌了全部前端代码：不禁止缓存的话，升级后浏览器还在跑旧页面，
+            # 新加的下拉/按钮"看不见"，只能让用户手动强刷 —— 这里直接杜绝。
+            self.send_header("Cache-Control","no-store, must-revalidate")
+            self.send_header("Pragma","no-cache")
             self.send_header("Content-Length",str(len(body)))
             self.end_headers(); self.wfile.write(body)
             return
@@ -3380,6 +3386,8 @@ class Handler(BaseHTTPRequestHandler):
             html = PAGE_HTML.replace("{channels_json}",json.dumps([c.to_dict() for c in channels]))
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Cache-Control","no-store, must-revalidate")
+            self.send_header("Pragma","no-cache")
             self.send_header("Content-Length",str(len(html.encode())))
             self.end_headers(); self.wfile.write(html.encode())
         elif path == "/api/status":
