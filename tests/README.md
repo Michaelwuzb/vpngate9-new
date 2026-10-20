@@ -46,6 +46,9 @@ python tests/vg9_type_strict_test.py
 
 # 12. 面板只接受域名访问：IP 直连 403 / 回环放行 / allow_ip_host 逃生阀     26 项
 python tests/vg9_host_guard_test.py
+
+# 13. 证书热重载：真握手比对指纹 / 半截 PEM 不炸 / 后台线程自己发现变更     17 项
+python tests/vg9_cert_reload_test.py
 ```
 
 依赖只有 Python 3 标准库和 Node.js（第 3、4 项需要）。Linux 上把 `python` 换成 `python3`。
@@ -73,3 +76,6 @@ python tests/vg9_host_guard_test.py
 - 第 11 项测的是"住宅模式下机房 IP 不参与"：东京都只剩机房时必须往埼玉/神奈川走，
   全站没有住宅时必须拒绝分配而不是拿机房顶上。第 8 项的 A0 已经从"放宽类型"改成
   这条新契约（行为变更是需求，不是回归）。
+- 第 13 项不是只看函数返回值：它真起一个 TLS 服务并**真的握手**，用握手证书的
+  SHA256 指纹判断"换没换证书"；还专门覆盖了"续期脚本写了一半"（半截 PEM、
+  key 换了 cert 还没换）时继续用旧证书、面板不挂。

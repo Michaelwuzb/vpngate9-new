@@ -1272,3 +1272,50 @@ do_GET、do_POST 都接了检查，且排在鉴权之前
 ```
 
 同时给 `vg9_https_test.py` 补了 F6f~F6h（no-store / Pragma），63 → 66 项。
+
+---
+
+## 二十二、面板证书热重载（续期全自动，不重启）
+
+### 22.1 问题
+
+`ui_tls.setup()` 只在 `main()` 里跑一次，`DualStackServer.ssl_context` 拿到手就一直不换。
+而 acme.sh / certbot / mailcow 续期时**只把新文件写进磁盘**，不会通知进程：
+
+- 忘了配 reload hook → 面板一直用旧证书，到期那天直接连不上；
+- 配了 `systemctl restart michaelvpn` → 每 60 天断一次 9 条隧道（约 30 秒）；
+- 更隐蔽的是"IP 访问已 403"之后，证书一坏就**没有任何入口**，只能 SSH 进去
+  `touch vpngate_data/allow_ip_host` 才能打开面板。
+
+### 22.2 做法
+
+`DualStackServer.ssl_context` 是**类属性**，`get_request()` 每次 accept 都重新读它——
+所以换证书只要把类属性指向新 context，不需要碰监听套接字：
+
+- 后台线程 `ui-cert-watch`，每 `UI_CERT_POLL_SEC`（60 秒）stat 一次 cert/key，
+  指纹取 `(st_mtime_ns, st_size)`，没变就什么都不做（不白白重建 context）；
+- 变了就 `ui_tls.build_context()` 重建，成功后**原子替换** `server_cls.ssl_context`，
+  并通过 `_UI_TLS_INFO` 把剩余天数刷新给 `/api/status`；
+- 重建失败（续期脚本正在覆盖文件、读到半截 PEM、key 换了还没换 cert 导致
+  `KEY_VALUES_MISMATCH`）**一律保留旧 context**，按 1/5/30/60 次节流打日志后下一轮重试。
+  最坏情况只是"还差一分钟才换上新证书"，不会把面板弄成没有 HTTPS。
+
+这样一来：**不需要给 acme.sh / certbot 配任何 michaelvpn 的 reload hook**，
+续期完成 60 秒内自动生效，新旧连接都不受影响，隧道一次都不断。
+
+### 22.3 验证
+
+新增 `tests/vg9_cert_reload_test.py`（17 项）。不是只断言函数返回值，
+而是真起一个 `ThreadingHTTPServer` **真的握手**，比对握手证书的 SHA256：
+
+```
+文件没变                -> unchanged（context 不重建）
+换一张证书              -> reloaded，新连接拿到的证书指纹变了
+写半截 PEM              -> failed，旧证书继续服务（握手仍成功）
+文件修好                -> 下一轮自动接上
+后台线程                -> 不需要任何外部触发，改文件 1.2 秒内生效
+没有证书（明文 HTTP）    -> skipped，不起线程
+热重载前后              -> 端口没变、server 对象没换
+```
+
+全量回归：49+36+66+27+77+51+28+43+68+44+47+49 + 前端校验，全绿。

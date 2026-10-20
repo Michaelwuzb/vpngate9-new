@@ -3333,6 +3333,87 @@ _UI_TLS_INFO: dict | None = None          # main() 里 ui_tls.setup() 之后填�
 _ui_hosts_cache: dict = {"at": 0.0, "hosts": frozenset()}
 _ui_hosts_denied_at: list[float] = [0.0]
 
+# ---- 面板证书热重载 ----
+# acme.sh / certbot / mailcow 续期时只是把新文件**写进磁盘**，进程手里还是启动时加载的
+# SSLContext。以前靠"续期脚本重启面板"捎带解决，但重启会断开 9 条隧道；更糟的是忘了配
+# reload 就等于没续——旧证书到期那天面板直接连不上，而 IP 访问已被 403 挡住，连兜底都没有。
+# 这里改成自检：后台每分钟 stat 一次证书/私钥（mtime + size），一变就重建 context 并原子
+# 替换 DualStackServer.ssl_context。get_request() 每次 accept 都读这个类属性，所以新连接
+# 立刻用新证书、老连接照旧，隧道一次都不用断，也不依赖任何外部 reload hook。
+UI_CERT_POLL_SEC = 60
+_ui_cert_state: dict = {"stamp": None, "fails": 0}
+
+
+def _cert_file_stamp(paths) -> tuple:
+    """证书文件的"版本指纹"：(mtime_ns, size)。取不到就返回空元组。"""
+    stamp = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except (OSError, TypeError):
+            return ()
+        stamp.append((st.st_mtime_ns, st.st_size))
+    return tuple(stamp)
+
+
+def reload_ui_cert_if_changed(server_cls, info: dict | None = None, *,
+                              force: bool = False) -> str:
+    """证书文件变了就重建 SSLContext 并替换掉 server_cls.ssl_context。
+
+    返回 "reloaded" / "unchanged" / "failed" / "skipped"。
+    失败时**保留旧 context**（续期脚本正在覆盖文件、读到半截 PEM 是常有的事），
+    下一轮自检会重试——绝不能因为一次读失败把面板弄成没有 HTTPS。
+    """
+    global _UI_TLS_INFO
+    info = info if info is not None else _UI_TLS_INFO
+    if not info or not info.get("cert") or not info.get("key"):
+        return "skipped"
+    paths = (info["cert"], info["key"])
+    stamp = _cert_file_stamp(paths)
+    if not stamp:
+        return "failed"
+    if not force and stamp == _ui_cert_state["stamp"]:
+        return "unchanged"
+    try:
+        ctx = ui_tls.build_context(info["cert"], info["key"])
+    except Exception as e:
+        _ui_cert_state["fails"] += 1
+        n = _ui_cert_state["fails"]
+        if n in (1, 5, 30) or n % 60 == 0:
+            log(f"[UI] 证书重载失败({type(e).__name__}: {e})，继续使用旧证书，{UI_CERT_POLL_SEC}s 后重试")
+        return "failed"
+    server_cls.ssl_context = ctx
+    days = ui_tls.cert_days_left(info["cert"])
+    info["context"] = ctx
+    info["days_left"] = days
+    _UI_TLS_INFO = info
+    _ui_cert_state["stamp"] = stamp
+    _ui_cert_state["fails"] = 0
+    tail = f"，剩余 {days:.0f} 天" if isinstance(days, (int, float)) else ""
+    log(f"[UI] 检测到证书更新，已热重载（{info.get('source') or '证书'}{tail}），连接未中断")
+    return "reloaded"
+
+
+def start_ui_cert_watcher(server_cls, info: dict | None = None):
+    """起一个后台线程盯着证书文件；没有证书（明文 HTTP）就不起。"""
+    info = info if info is not None else _UI_TLS_INFO
+    if not info or not info.get("cert"):
+        return None
+    _ui_cert_state["stamp"] = _cert_file_stamp((info["cert"], info["key"]))
+    _ui_cert_state["fails"] = 0
+
+    def _loop():
+        while True:
+            time.sleep(UI_CERT_POLL_SEC)
+            try:
+                reload_ui_cert_if_changed(server_cls, info)
+            except Exception as e:      # 巡检线程绝不能死
+                log(f"[UI] 证书自检异常: {type(e).__name__}: {e}")
+
+    t = threading.Thread(target=_loop, name="ui-cert-watch", daemon=True)
+    t.start()
+    return t
+
 
 def cert_dns_names(cert_path: str) -> frozenset:
     """读证书里所有 DNS 型 SAN（域名）。读不出来就返回空集。"""
@@ -4279,6 +4360,9 @@ def main():
         server = DualStackServer((UI_HOST, UI_PORT), Handler)
     except Exception:
         server = DualStackServer(("0.0.0.0", UI_PORT), Handler)
+    # 证书续期（acme.sh / certbot / mailcow）只改磁盘上的文件，不会通知进程。
+    # 从这一刻起每分钟自检一次，文件一变就热重载，不重启、不断隧道。
+    start_ui_cert_watcher(DualStackServer, _ui_tls_info)
     server.serve_forever()
 
 if __name__ == "__main__":
