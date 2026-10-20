@@ -263,6 +263,17 @@ PING_WORKERS = max(1, int(os.environ.get("PING_WORKERS", "32")))       # 延迟�
 PING_TIMEOUT = max(1.0, float(os.environ.get("PING_TIMEOUT", "3")))    # 单个节点 TCP 探测超时(秒)
 SPEEDTEST_MAX_NODES = max(1, int(os.environ.get("SPEEDTEST_MAX_NODES", "20")))  # 单次批量真实测速上限
 
+# 测速专用口：端口**紧跟在 9 条通道之后**（47928~47936 → 47937），另配一条 tun9。
+# 原来「测带宽」是借一条空闲通道来当探针：9 条都连着就直接报"没有空闲通道"，
+# 借到了也是临时占掉某条通道（通常就是 ch0）的 tun 和代理口，测速期间那条通道的
+# 流量会被导到测试节点上。现在给它一个专属的、面板上不显示的端口，两者彻底分开。
+SPEEDTEST_TUN_INDEX = NUM_CHANNELS                                   # tun9
+try:
+    SPEEDTEST_PROXY_PORT = int(os.environ.get("VPNGATE_SPEEDTEST_PORT")
+                               or PROXY_BASE_PORT + NUM_CHANNELS)
+except ValueError:
+    SPEEDTEST_PROXY_PORT = PROXY_BASE_PORT + NUM_CHANNELS
+
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 CONFIG_DIR.mkdir(exist_ok=True, parents=True)
 if not AUTH_FILE.exists():
@@ -273,6 +284,9 @@ if not AUTH_FILE.exists():
 class Channel:
     def __init__(self, index: int):
         self.index = index
+        # 日志里用的标签。正式通道是 CH0~CH8；测速专用通道会被改成 SPEED，
+        # 免得日志里冒出个 [CH9] 让人以为多了一条通道。
+        self.label = f"CH{index}"
         self.tun = f"tun{index}"
         self.proxy_port = PROXY_BASE_PORT + index
         self.force_country = ""
@@ -343,6 +357,13 @@ class Channel:
         return d
 
 channels: list[Channel] = [Channel(i) for i in range(NUM_CHANNELS)]
+# 测速专用通道：**刻意不放进 channels**。放进去就会被面板渲染成第 10 张卡片、
+# 被 save_channels 落盘、被看门狗当成正式通道去巡检重连——都不是我们要的。
+# 它只在「测带宽」任务期间临时连一个节点，测完立刻断开。
+speedtest_ch = Channel(SPEEDTEST_TUN_INDEX)
+speedtest_ch.proxy_port = SPEEDTEST_PROXY_PORT
+speedtest_ch.label = "SPEED"          # 日志里不出现 CH9，免得看着像第 10 条通道
+_speedtest_proxy_lock = threading.Lock()
 nodes_cache: list[dict[str, Any]] = []
 nodes_cache_lock = threading.Lock()
 _last_node_ids: set[str] = set()  # Track previous fetch for duplicate detection
@@ -466,7 +487,7 @@ def mark_node_bad(ch: "Channel", reason: str) -> None:
     if upstream_alive():
         skip_node(ch.node_ip, reason)
     else:
-        log(f"[CH{ch.index}] 本机出口网络不通，暂不把 {ch.node_ip or '当前节点'} 记为坏节点")
+        log(f"[{ch.label}] 本机出口网络不通，暂不把 {ch.node_ip or '当前节点'} 记为坏节点")
 
 # === 新节点标记 ===
 def load_seen_nodes() -> None:
@@ -666,19 +687,19 @@ def run_channel_speedtest(ch: Channel) -> dict[str, Any]:
             ch.speed_mbps = float(res.get("mbps") or 0.0)
             ch.speed_ttfb_ms = int(res.get("ttfb_ms") or 0)
             ch.speed_error = ""
-            log(f"[speed] CH{ch.index} {ch.speed_mbps} Mbps (TTFB {ch.speed_ttfb_ms}ms)")
+            log(f"[speed] {ch.label} {ch.speed_mbps} Mbps (TTFB {ch.speed_ttfb_ms}ms)")
         else:
             ch.speed_mbps = 0.0
             ch.speed_error = str(res.get("error") or "测速失败")[:200]
-            log(f"[speed] CH{ch.index} 失败: {ch.speed_error}")
+            log(f"[speed] {ch.label} 失败: {ch.speed_error}")
     return res
 
 def start_channel_speedtest(ch: Channel) -> dict[str, Any]:
     if ch.state != "connected":
-        return {"ok": False, "error": f"CH{ch.index} 未连接，无法测速"}
+        return {"ok": False, "error": f"{ch.label} 未连接，无法测速"}
     with ch.lock:
         if ch.speed_testing:
-            return {"ok": False, "error": f"CH{ch.index} 正在测速中"}
+            return {"ok": False, "error": f"{ch.label} 正在测速中"}
         ch.speed_testing = True
         ch.speed_error = ""
     threading.Thread(target=run_channel_speedtest, args=(ch,), daemon=True).start()
@@ -698,25 +719,20 @@ def start_all_channel_speedtest() -> dict[str, Any]:
     log(f"[speed] 并发测速通道 {started}")
     return {"ok": True, "started": started, "skipped": skipped}
 
-def _find_probe_channel() -> Channel | None:
-    """找一条可以借来当"测速探针"的空闲通道。
+def _probe_channel() -> Channel:
+    """节点实测用的探针通道：**不是 ch0~ch8 里的任何一条**。
 
-    只挑 disconnected 的；借用前会临时把 enabled 置 False，
-    这样外部的守护进程在测速期间就不会来抢这条通道(它靠 /api/status 的 enabled 判断)。
+    用的是紧跟通道端口段之后的那一个口（默认 47937）和 tun9，面板上不显示、
+    不落盘、不受看门狗管 —— 所以 9 条通道全连上也照样能测速，
+    测速期间也不会把任何一条正式通道的出口切到测试节点上。
     """
-    for ch in channels:
-        if ch.state == "disconnected" and not ch.reserved_ip and not ch.enabled:
-            return ch
-    for ch in channels:
-        if ch.state == "disconnected" and not ch.reserved_ip:
-            return ch
-    return None
+    return speedtest_ch
 
 def start_node_speed_task(ids: list[str] | None = None, limit: int | None = None) -> dict[str, Any]:
     """对指定节点（或全部新节点）逐个建隧道实测带宽。
 
     代价说明：每个节点都要完整建一次隧道再拆掉，约 15~30 秒/个，
-    所以默认只取 limit 个，且必须有空闲通道可用。
+    所以默认只取 limit 个。探针是专用的测速口，不占用 ch0~ch8。
     """
     global _speed_task_stop
     with TASK_LOCK:
@@ -736,9 +752,9 @@ def start_node_speed_task(ids: list[str] | None = None, limit: int | None = None
     targets = [n for n in targets if n.get("config_text")][:cap]
     if not targets:
         return {"ok": False, "error": "没有可测速的节点（节点池为空或未选中）"}
-    if _find_probe_channel() is None:
-        return {"ok": False, "error": "没有空闲通道可用：9 条通道都在使用中。"
-                                     "请先断开一条，或在面板上关掉它的守护自动重连"}
+    prox_err = ensure_speedtest_proxy()
+    if prox_err:
+        return {"ok": False, "error": f"{prox_err}（测速专用口，ch0~ch8 的代理不受影响）"}
     _speed_task_stop = threading.Event()
     with TASK_LOCK:
         SPEED_TASK.update({"running": True, "done": 0, "total": len(targets), "current": "",
@@ -755,12 +771,6 @@ def stop_node_speed_task() -> dict[str, Any]:
     log("[speed] 收到停止请求，当前节点测完就收工")
     return {"ok": True}
 
-def _restore_probe_channel(ch: Channel, borrowed_enabled: bool | None) -> None:
-    """归还借用的通道：恢复 enabled 并把状态复位到 disconnected。"""
-    if borrowed_enabled is not None:
-        ch.enabled = borrowed_enabled
-        save_channels()
-
 def _node_speed_worker(targets: list[dict[str, Any]]) -> None:
     for node in targets:
         if _speed_task_stop.is_set():
@@ -771,15 +781,10 @@ def _node_speed_worker(targets: list[dict[str, Any]]) -> None:
         with TASK_LOCK:
             SPEED_TASK["current"] = nid
             SPEED_TASK["current_ip"] = nicename
-        ch = _find_probe_channel()
-        if ch is None:
-            with TASK_LOCK: SPEED_TASK["error"] = "空闲通道被占用，任务中断"
-            break
-        borrowed = ch.enabled
+        ch = _probe_channel()
         ok = False
         try:
             with ch.lock:
-                ch.enabled = False        # 测速期间别让守护进程来抢这条通道
                 ch.speed_testing = True
             ok = connect_channel(ch, node)
             if ok:
@@ -824,7 +829,6 @@ def _node_speed_worker(targets: list[dict[str, Any]]) -> None:
                 ch.speed_testing = False
             try: disconnect_channel(ch)
             except Exception: pass
-            _restore_probe_channel(ch, borrowed)
             with TASK_LOCK: SPEED_TASK["done"] += 1
             persist_nodes()
 
@@ -1029,7 +1033,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
     config_path = CONFIG_DIR / f"ch{ch.index}.ovpn"
     config_path.write_text(config_text)
     cmd = openvpn_cmd(str(config_path), ch.tun)
-    log(f"[CH{ch.index}] Starting {ch.tun}...")
+    log(f"[{ch.label}] Starting {ch.tun}...")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     except Exception as e:
@@ -1055,7 +1059,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             break
         time.sleep(1)
     if not tunnel_ok:
-        log(f"[CH{ch.index}] Tunnel dead, switching node...")
+        log(f"[{ch.label}] Tunnel dead, switching node...")
         stop_process(proc)
         ch.state = "error"
         ch.error = "tunnel unreachable"
@@ -1069,7 +1073,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
     # 走代理的流量会因为 oif 规则还没落地而从物理网卡直接出去（出口 IP 与面板不符）。
     table = policy_table(ch.index)
     if not setup_policy_routing(ch.tun, table) or not policy_routing_ok(ch.tun, table):
-        log(f"[CH{ch.index}] 策略路由未生效，放弃本次连接")
+        log(f"[{ch.label}] 策略路由未生效，放弃本次连接")
         stop_process(proc)
         cleanup_policy_routing(table)
         ch.state = "error"; ch.error = "policy routing not applied"
@@ -1081,7 +1085,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
     # 代理端口必须真的在听。隧道通了不代表代理可用：端口被占时代理线程早就静默退出了，
     # 这种情况下面板会显示"9 个通道全部已连接"、实际却有几个根本用不了。
     if not proxy_port_ready(ch.proxy_port):
-        log(f"[CH{ch.index}] 本地代理端口 {ch.proxy_port} 无响应，放弃本次连接")
+        log(f"[{ch.label}] 本地代理端口 {ch.proxy_port} 无响应，放弃本次连接")
         stop_process(proc)
         cleanup_policy_routing(table)
         ch.state = "error"; ch.error = f"proxy port {ch.proxy_port} not listening"
@@ -1105,13 +1109,13 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             if ch.force_region and node.get("region_key"):
                 landed = node["region_key"].strip().upper()
                 ch.region_lock = landed
-    log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip} (table {table})")
+    log(f"[{ch.label}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip} (table {table})")
     if landed:
         want_key = region_key_of(ch.force_region)
         if want_key and landed != want_key:
             pref = region_geo.lookup_prefecture(landed)
             want = region_geo.lookup_prefecture(want_key)
-            log(f"[CH{ch.index}] 出口落在 {pref['name'] if pref else landed}"
+            log(f"[{ch.label}] 出口落在 {pref['name'] if pref else landed}"
                 f"（{want['name'] if want else want_key} 当前没有可用节点），已锁定该县："
                 f"后续重连不会再切回 {want['name'] if want else want_key}")
     return True
@@ -1126,7 +1130,7 @@ def disconnect_channel(ch: Channel):
         ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0; ch.connect_fails = 0
         release_slot(ch)
         # Keep config file for watchdog retry
-    log(f"[CH{ch.index}] Disconnected")
+    log(f"[{ch.label}] Disconnected")
 
 def port_bindable(family: int, addr: tuple) -> str:
     """端口能不能绑；返回空串=可用，否则返回原因。"""
@@ -1146,9 +1150,9 @@ def port_bindable(family: int, addr: tuple) -> str:
 def preflight_ports() -> dict[str, str]:
     """启动前先探一遍要用的端口，把冲突提前暴露出来。
 
-    9 条通道要占 10 个端口（面板 8787 + 代理 47928~47936）。任一被占，
-    服务要么起不来要么某个通道静默失效，日志里只有子线程的一行 print，
-    排查起来很绕。这里在主线程里一次探清，直接写进启动日志。
+    9 条通道 + 1 个测速专用口要占 11 个端口（面板 8787 + 代理 47928~47936 +
+    测速 47937）。任一被占，服务要么起不来要么某个通道静默失效，日志里只有子线程
+    的一行 print，排查起来很绕。这里在主线程里一次探清，直接写进启动日志。
     """
     problems: dict[str, str] = {}
     if port_bindable(socket.AF_INET6, ("::", UI_PORT)) and port_bindable(socket.AF_INET, ("0.0.0.0", UI_PORT)):
@@ -1157,6 +1161,11 @@ def preflight_ports() -> dict[str, str]:
         reason = port_bindable(socket.AF_INET, (LOCAL_PROXY_HOST, ch.proxy_port))
         if reason:
             problems[f"proxy{ch.index}"] = f"代理端口 {ch.proxy_port} 不可用: {reason}"
+    # 测速口单独报：它挂了只影响「测带宽」，9 条通道照常工作，不能混在一起吓人
+    reason = port_bindable(socket.AF_INET, (LOCAL_PROXY_HOST, SPEEDTEST_PROXY_PORT))
+    if reason:
+        problems["speedtest"] = (f"测速专用端口 {SPEEDTEST_PROXY_PORT} 不可用: {reason}"
+                                 "（只影响「测带宽」，通道代理不受影响）")
     return problems
 
 def start_all_proxies() -> dict[int, str]:
@@ -1187,6 +1196,36 @@ def start_all_proxies() -> dict[int, str]:
     ok = len(channels) - len(failed)
     log(f"[init] 代理端口就绪 {ok}/{len(channels)}" + (f"，失败通道: {sorted(failed)}" if failed else ""))
     return failed
+
+def ensure_speedtest_proxy() -> str:
+    """确保测速专用口的本地代理在监听；返回空串=就绪，否则是失败原因。
+
+    单独拆出来（而不是塞进 start_all_proxies）有两个原因：
+      1. 它不参与"9 条通道就绪 x/9"的统计，也不该出现在面板上；
+      2. 启动时这个端口也许被临时占着，测速前再试一次就能起来 ——
+         不该因为一次 bind 失败就让「测带宽」在本进程内永久不可用。
+    和 9 条通道共用同一套 proxy_server_multi，只是 tun 指向 tun9。
+    """
+    import proxy_server_multi as proxy
+    with _speedtest_proxy_lock:
+        if proxy_port_ready(speedtest_ch.proxy_port, tries=1):
+            speedtest_ch.proxy_error = ""
+            return ""
+        try:
+            listener = proxy.create_proxy_listener(LOCAL_PROXY_HOST, speedtest_ch.proxy_port)
+        except Exception as e:
+            msg = f"测速专用端口 {speedtest_ch.proxy_port} 不可用: {e}"
+            speedtest_ch.proxy_error = msg
+            log(f"[proxy] {msg}")
+            return msg
+        speedtest_ch.proxy_error = ""
+        threading.Thread(target=proxy.serve_proxy,
+                         args=(listener, LOCAL_PROXY_HOST, speedtest_ch.proxy_port,
+                               speedtest_ch.tun),
+                         daemon=True).start()
+        log(f"[init] 测速专用口就绪 {LOCAL_PROXY_HOST}:{speedtest_ch.proxy_port} "
+            f"-> {speedtest_ch.tun}（面板不显示，仅「测带宽」使用）")
+        return ""
 
 # === Node Fetching ===
 _last_fetch_source = ""      # 最近一次节点数据的来源（在线地址 / snapshot / 空）
@@ -2390,7 +2429,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="btn" onclick="refreshNodes()">刷新</button>
     <button class="btn" onclick="fetchNodes()">获取节点</button>
     <button class="btn" id="btnPing" onclick="nodePing()" title="对节点 IP:端口做 TCP 握手探测，并发跑，只测连通与延迟，不产生流量">测延迟</button>
-    <button class="btn" id="btnSpeed" onclick="nodeSpeed()" title="借一条空闲通道逐个建隧道实测下载带宽，约 15~30 秒/个">测带宽</button>
+    <button class="btn" id="btnSpeed" onclick="nodeSpeed()" title="用测速专用口（紧跟 9 条通道端口之后的那个，ch0~ch8 不受影响）逐个建隧道实测下载带宽，约 15~30 秒/个">测带宽</button>
     <button class="btn d" id="btnStop" style="display:none" onclick="stopSpeed()">停止测速</button>
     <button class="btn" onclick="clearNew()" title="把当前所有节点的「新」标记清掉（首现时间记录保留）">清除新标记</button>
     <button class="btn" onclick="chSpeedAll()" title="对当前已连接的通道并发测速，各走自己的出口">通道测速</button>
@@ -2759,10 +2798,10 @@ async function nodePing(){
 async function nodeSpeed(){
   var ids=checkedIds();
   var q=ids.length?('?ids='+encodeURIComponent(ids.join(','))):'';
-  var tip=ids.length?('将占用一条空闲通道，依次为勾选的 '+ids.length+' 个节点实测带宽，'
-                     +'每个约 15~30 秒，期间该通道不可用。'):
-                    '未勾选任何节点，将实测「新节点」（最多 20 个）。将占用一条空闲通道，'
-                     +'每个节点约 15~30 秒，期间该通道不可用。';
+  var tip=ids.length?('将通过测速专用口，依次为勾选的 '+ids.length+' 个节点实测带宽，'
+                     +'每个约 15~30 秒。9 条通道的出口和端口都不受影响。'):
+                    '未勾选任何节点，将实测「新节点」（最多 20 个）。将通过测速专用口，'
+                     +'每个节点约 15~30 秒。9 条通道的出口和端口都不受影响。';
   if(!confirm(tip+'\n\n继续？')) return;
   var d=await doPost('/api/nodes/speedtest'+q);
   if(!d.ok) alert(d.error||'启动失败'); else document.getElementById('job').style.display='';
@@ -3460,7 +3499,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
             return
 
-        # --- 真实带宽测速：借一条空闲通道逐个建隧道实测 ---
+        # --- 真实带宽测速：用测速专用口逐个建隧道实测（不占用 ch0~ch8）---
         if path == "/api/nodes/speedtest":
             ids_q = (params.get("ids", [""])[0] or "").strip()
             ids = [x.strip() for x in ids_q.split(",") if x.strip()] if ids_q else None
@@ -3852,6 +3891,8 @@ def main():
     for ch in channels:
         # tun 设备已经随进程消失，但上次写的 ip rule/route 会留在内核里继续劫持流量
         cleanup_policy_routing(policy_table(ch.index))
+    # 测速口上次被杀掉时也会留下自己的 ip rule（表号 = 209），一起清掉
+    cleanup_policy_routing(policy_table(speedtest_ch.index))
     port_problems = preflight_ports()
     for msg in port_problems.values():
         log(f"[init] 端口预检: {msg}")
@@ -3867,6 +3908,8 @@ def main():
     if proxy_failures:
         log(f"[init] 警告: {len(proxy_failures)} 个通道的本地代理没起来，"
             f"这些通道即使隧道通了也无法通过代理访问（面板会标红）")
+    # 测速专用口：起不来不影响任何通道，只在「测带宽」时再试一次
+    ensure_speedtest_proxy()
     threading.Thread(target=collector_loop, daemon=True).start()
     log("[init] Collector started")
     threading.Thread(target=channel_watchdog, daemon=True).start()

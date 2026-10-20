@@ -365,7 +365,9 @@ del os.environ["VPNGATE_STRICT_TLS"]
 head("G. 安装脚本")
 
 sh = open(os.path.join(FIX, "install.sh"), encoding="utf-8").read()
-check("G1 卸载会清理策略路由表", "cleanup_policy_routing" in sh and "seq 200 208" in sh)
+# 200~208 是 9 条通道，209 是「测带宽」专用口（tun9）—— 卸载时都得清，
+# 否则测速中途被 kill 留下的 ip rule 会继续劫持流量
+check("G1 卸载会清理策略路由表", "cleanup_policy_routing" in sh and "seq 200 209" in sh)
 check("G1b 卸载分支确实调用了它",
       sh.split("=== 卸载功能 ===", 1)[1].split("exit 0", 1)[0].count("cleanup_policy_routing") >= 1)
 check("G2 ml 的卸载分支也清理路由",

@@ -338,6 +338,23 @@ enabled_states = [c["enabled"] for c in s["channels"]]
 check("测速借用的通道没有把 enabled 弄乱",
       all(isinstance(e, bool) for e in enabled_states), str(enabled_states))
 
+head("[7.1] 测速专用口：端口往后延一个，且不出现在面板上")
+ports = sorted(c["proxy_port"] for c in s["channels"])
+check("面板仍然只有 9 条通道", len(s["channels"]) == 9, str(len(s["channels"])))
+check("通道端口是连续的 9 个", ports == list(range(ports[0], ports[0] + 9)), str(ports))
+check("通道编号最大是 8", max(c["index"] for c in s["channels"]) == 8,
+      str([c["index"] for c in s["channels"]]))
+check("测速口不在通道列表里（面板不显示）", ports[-1] + 1 not in ports, str(ports))
+srv_log = os.path.join(WORK, "srv.log")
+log_txt = open(srv_log, encoding="utf-8", errors="replace").read() \
+    if os.path.exists(srv_log) else ""
+probe_line = next((ln for ln in log_txt.splitlines() if "测速专用口就绪" in ln), "")
+check("启动日志写明测速专用口就绪", bool(probe_line), log_txt[-500:])
+check("测速口 = 最后一个通道端口 + 1", f":{ports[-1] + 1}" in probe_line, probe_line)
+check("节点测速不再报「没有空闲通道」（旧实现会）",
+      "没有空闲通道" not in json.dumps(task, ensure_ascii=False),
+      json.dumps(task, ensure_ascii=False)[:300])
+
 head("[8] 停止接口的边界")
 st, d = jpost("/api/nodes/speedtest_stop")
 check("没有任务时停止会给出明确提示", st == 409 and d.get("ok") is False, f"status={st} {d}")

@@ -11,7 +11,7 @@
 在**仓库根目录**执行：
 
 ```bash
-# 1. 新节点标记逻辑 + 测速模块（含 mock SOCKS5 对端、chunked/EOF/限速场景）  37 项
+# 1. 新节点标记 + 测速模块 + 测速专用口（mock SOCKS5、chunked/EOF/限速）  49 项
 python tests/vg9_seen_speed_test.py
 
 # 2. 多出口分配逻辑（国家 / IP类型 / 同一国家 三种模式）                    36 项
@@ -23,7 +23,7 @@ python tests/vg9_frontend_check.py
 # 4. 前端 DOM stub 单测（node，无需浏览器）                                 44 项
 node tests/vg9_frontend_test.js
 
-# 5. 端到端：起真实面板实例 + mock VPNGate 节点源                          61 项
+# 5. 端到端：起真实面板实例 + mock VPNGate 节点源 + 测速专用口            68 项
 python tests/vg9_new_speed_http_test.py
 
 # 6. 端到端：分配接口（含登录态、并发、dry_run）                            44 项

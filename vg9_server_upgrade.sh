@@ -153,7 +153,7 @@ preflight() {
     ok "python3: $(python3 -V 2>&1)"
     ok "当前提交: $(cd "$INSTALL_DIR" && git rev-parse --short HEAD)"
     ok "服务状态: $(systemctl is-active "$SERVICE" 2>/dev/null || echo 未运行)"
-    ok "策略路由: $(count_rules '10[0-8]') 条旧表(100~108) / $(count_rules '20[0-8]') 条新表(200~208)"
+    ok "策略路由: $(count_rules '10[0-8]') 条旧表(100~108) / $(count_rules '20[0-9]') 条新表(200~209)"
 
     ( cd "$INSTALL_DIR" && git_c fetch --quiet origin "$BRANCH" ) \
         || die "git fetch 失败（检查服务器到 GitHub 的网络）"

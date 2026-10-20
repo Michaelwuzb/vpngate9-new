@@ -363,6 +363,52 @@ check("B7b 不支持的协议被拒绝", re_.get("ok") is False and "协议" in 
 rf_ = ST.speedtest_via_proxy("127.0.0.1", SOCKS_PORT, url="http://127.0.0.1:1/x", size=1000, timeout=3)
 check("B7c 目标不可达时返回失败", rf_.get("ok") is False, str(rf_))
 
+# ------------------------------------------------------------ [C] 测速专用口
+head("[C] 测速专用口（端口往后延一个，不占用 ch0~ch8、也不显示）")
+ch_ports = [c.proxy_port for c in M.channels]
+check("C1 仍然只有 9 条正式通道", len(M.channels) == 9, str(len(M.channels)))
+check("C2 通道端口是连续的 47928~47936",
+      ch_ports == list(range(M.PROXY_BASE_PORT, M.PROXY_BASE_PORT + M.NUM_CHANNELS)),
+      str(ch_ports))
+check("C3 测速口 = 最后一个通道端口 + 1",
+      M.speedtest_ch.proxy_port == M.PROXY_BASE_PORT + M.NUM_CHANNELS,
+      str(M.speedtest_ch.proxy_port))
+check("C4 测速口不在 9 条通道的端口里", M.speedtest_ch.proxy_port not in ch_ports)
+check("C5 测速口不在 channels 列表里（面板不会渲染它）",
+      all(c is not M.speedtest_ch for c in M.channels))
+check("C6 测速口用独立的 tun9", M.speedtest_ch.tun == f"tun{M.NUM_CHANNELS}",
+      M.speedtest_ch.tun)
+check("C7 测速口走独立的策略路由表", M.policy_table(M.speedtest_ch.index) ==
+      M.POLICY_TABLE_BASE + M.NUM_CHANNELS)
+
+# 落盘：channels.json 只能有 0~8，测速口不该被写进去（重启后不会变成第 10 条通道）
+M.save_channels()
+cfg = M.read_json(M.CHANNELS_FILE)
+check("C8 channels.json 里只有 0~8 这 9 条",
+      sorted(cfg.keys()) == [str(i) for i in range(M.NUM_CHANNELS)], str(sorted(cfg.keys())))
+
+# 探针直接返回专用通道，不再"借"任何一条正式通道
+check("C9 探针拿到的是测速口本身", M._probe_channel() is M.speedtest_ch)
+
+# 9 条通道全部"在用"时，仍然能启动节点测速（老实现在这里会直接报没有空闲通道）
+for c in M.channels:
+    c.state = "connected"
+    c.node_ip = f"10.0.0.{c.index + 1}"
+with M.nodes_cache_lock:
+    M.nodes_cache = [make_node("n-probe", "127.0.0.1", 1, cfg="client\n")]
+r = M.start_node_speed_task(["n-probe"])
+check("C10 9 条通道全连线时也能启动测速任务", r.get("ok") is True, str(r))
+# 起完立刻停，避免真去调 openvpn（本机没有也不影响：任务会如实失败后收敛）
+if r.get("ok"):
+    M.stop_node_speed_task()
+    for _ in range(40):
+        if not M.SPEED_TASK["running"]:
+            break
+        time.sleep(0.2)
+check("C11 任务能收敛结束", M.SPEED_TASK["running"] is False, str(M.SPEED_TASK.get("done")))
+check("C12 启动测速没有把任何正式通道的 enabled 弄乱",
+      all(c.enabled is False for c in M.channels), str([c.enabled for c in M.channels]))
+
 head("结果")
 print(f"PASS={PASS}  FAIL={FAIL}")
 if FAIL:

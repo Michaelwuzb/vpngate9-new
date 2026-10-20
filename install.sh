@@ -20,10 +20,12 @@ REPO_NAME="${2:-vpngate9-new}"
 BRANCH="main"
 
 # 策略路由表号：通道 i 用 200+i（主程序里的 POLICY_TABLE_BASE=200）。
+# 另有 209 是「测带宽」专用口（tun9）的表号，虽然它平时连完就自己清，
+# 但测速中途被 kill 就会留下规则，卸载时一并清掉。
 # 卸载时必须清干净：tun 设备会随进程消失，但 ip rule/route 会留在内核里，
 # 继续把别人的流量往已经不存在的设备上引。
 cleanup_policy_routing() {
-    for t in $(seq 200 208); do
+    for t in $(seq 200 209); do
         # ip rule del 每次只删一条匹配项，必须循环删到删不动
         while ip rule del table "$t" 2>/dev/null; do :; done
         ip route flush table "$t" 2>/dev/null || true
@@ -242,8 +244,8 @@ case "${1:-status}" in
         rm -f /lib/systemd/system/michaelvpn.service
         rm -f /lib/systemd/system/vpngate9-guard.service
         systemctl daemon-reload
-        # 清掉 9 条通道写的策略路由（tun 没了但 ip rule 还在，会劫持其它程序的流量）
-        for t in $(seq 200 208); do
+        # 清掉 9 条通道 + 测速口的策略路由（tun 没了但 ip rule 还在，会劫持其它程序的流量）
+        for t in $(seq 200 209); do
             while ip rule del table "$t" 2>/dev/null; do :; done
             ip route flush table "$t" 2>/dev/null || true
         done
@@ -332,7 +334,7 @@ echo -e "  默认密码:  ${CYAN}admin${NC}"
 echo -e "  ${YELLOW}请登录后点右上角\"管理员\"立即修改账号和密码${NC} (改完需重新登录)"
 echo -e "  忘记密码:  ${CYAN}ml passwd <新密码>${NC}  或  ${CYAN}ml passwd <新账号> <新密码>${NC}"
 echo -e "  代理端口:  ${CYAN}47928~47936${NC} (tun0~tun8)"
-echo -e "  策略路由:  ${CYAN}table 200~208${NC} (卸载时自动清理)"
+echo -e "  策略路由:  ${CYAN}table 200~209${NC} (卸载时自动清理)"
 echo -e "  状态:      ${CYAN}ml status${NC}"
 echo -e "  日志:      ${CYAN}ml logs${NC}"
 if [ "${ML_NO_GUARD:-0}" = "1" ]; then
