@@ -35,7 +35,7 @@ python tests/vg9_https_test.py
 # 8. 失败节点短期跳过 + 国家无货时放宽到全池 + 通道指数退避（修"某通道无限重连"）  26 项
 python tests/vg9_node_pick_test.py
 
-# 9. 精确到县（都道府县）：名称归一 / 固定递补顺序 / 就近降级 / 降级后锁定不回切  62 项
+# 9. 精确到县：名称归一 / 固定递补顺序 / 就近降级 / 锁定不回切 / 降级前重扫  77 项
 python tests/vg9_region_test.py
 
 # 10. 端到端：/api/regions + auto_assign?region= + 页面县选择器/顺序提示      38 项
@@ -61,3 +61,6 @@ python tests/vg9_region_http_test.py
 - 第 9 项是纯函数测试，用合成节点（自带经纬度）跑，**不联网**：行政区判定不该受节点源可用性影响。
 - 第 9 项同时覆盖"降级后锁定"：`region_lock` 一旦落下，目标县恢复可用也不会被选回去
   （只有显式传 `locked=""`、或重新分配时才解除），这是防止出口 IP 反复跳的关键行为。
+- 第 9 项还覆盖"降级前重扫当前地区"：把 `refresh_nodes_once` 打桩成"换一个节点池"，
+  因此仍是**不联网**的；默认先关掉重扫（`REGION_RESCAN_ENABLED=False`），
+  只在第 12 组用例里单独打开，避免合成池子里该县没货时真去拉节点。

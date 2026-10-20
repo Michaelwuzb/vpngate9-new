@@ -219,6 +219,18 @@ NO_NODE_LOG_INTERVAL = int(os.environ.get("NO_NODE_LOG_INTERVAL", "1800"))    # 
 NODE_SKIP_TTL = int(os.environ.get("NODE_SKIP_TTL", "300"))     # 失败节点跳过时长(秒)
 NODE_SKIP_MAX = int(os.environ.get("NODE_SKIP_MAX", "200"))     # 最多记录条数（纯内存，防膨胀）
 
+# 「降级前先重扫当前地区」：准备从东京都退到埼玉之前，先确认东京都是不是**真的**没节点了。
+# 节点池默认 10 分钟才拉一次，这中间新上线的东京都节点如果不重扫就会被漏掉，
+# 结果明明有新 IP 却已经退到别的县了 —— 这正是本组参数要解决的问题。
+#   REGION_RESCAN_COOLDOWN  同一个县两次重扫的最小间隔（防 9 条通道并发刷爆节点源）
+#   REGION_RESCAN_MAX_AGE   节点池比这个秒数新就不重复联网，直接用当前池子算
+#   REGION_RESCAN_WAIT      面板规划时最多等一次正在进行的刷新多久（单通道路径不等）
+REGION_RESCAN_ENABLED = (os.environ.get("VPNGATE_REGION_RESCAN", "1") or "1").strip().lower() \
+    not in ("0", "off", "no", "false")
+REGION_RESCAN_COOLDOWN = float(os.environ.get("VPNGATE_REGION_RESCAN_COOLDOWN", "60") or 60)
+REGION_RESCAN_MAX_AGE = float(os.environ.get("VPNGATE_REGION_RESCAN_MAX_AGE", "20") or 20)
+REGION_RESCAN_WAIT = float(os.environ.get("VPNGATE_REGION_RESCAN_WAIT", "60") or 60)
+
 # 「自动分配出口」默认跳过的国家/地区：VPNGate 上的 CN 节点基本都是境内志愿者家宽，
 # 拿它当境外出口没有意义，而且通常只有 1 个节点、随时掉线。
 # 想连它仍可在面板上手动指定；想改这个行为用 VPNGATE_EXCLUDE_COUNTRIES= 覆盖(逗号分隔，留空=不排除)。
@@ -1179,6 +1191,7 @@ def start_all_proxies() -> dict[int, str]:
 # === Node Fetching ===
 _last_fetch_source = ""      # 最近一次节点数据的来源（在线地址 / snapshot / 空）
 _snapshot_saved_at = 0.0     # 本地快照的保存时间（内存里记一份，避免状态接口每次都读大文件）
+_nodes_refreshed_at = 0.0    # 节点池最近一次刷新完成的时间（"降级前重扫"据此判断池子够不够新）
 _ui_tls_info: dict | None = None   # 面板证书信息（None = 面板跑在明文 HTTP 上）
 
 
@@ -1299,7 +1312,7 @@ def refresh_nodes_once(tag: str = "fetch") -> dict[str, Any]:
     手动拉取、定时采集、启动时的首次拉取全部走这里，三条路径的标记口径必须一致，
     否则"新节点"会一会儿全亮一会儿全灭。
     """
-    global nodes_cache, _last_node_ids
+    global nodes_cache, _last_node_ids, _nodes_refreshed_at
     nodes = fetch_nodes()
     if not nodes:
         return {"total": 0, "new": 0, "new_ids": [], "baseline": False,
@@ -1311,6 +1324,7 @@ def refresh_nodes_once(tag: str = "fetch") -> dict[str, Any]:
     new_ids = {str(n.get("id") or "") for n in nodes if n.get("id")}
     with nodes_cache_lock: nodes_cache = nodes
     _last_node_ids = new_ids
+    _nodes_refreshed_at = time.time()
     _prune_seen(new_ids)
     persist_nodes()
     save_seen_nodes()
@@ -1464,6 +1478,163 @@ def region_target(country: str, region: str) -> dict | None:
     if not tgt.get("name"):
         tgt["name"] = region
     return tgt
+
+
+# ----------------------------------------------------------------------------
+# 降级前先重扫当前地区
+# ----------------------------------------------------------------------------
+# 需求：切到下一个地区之前，先扫一下当前地区有没有新节点；有新的就不切。
+# 为什么需要：节点池默认 10 分钟才拉一次（FETCH_INTERVAL），东京都在这中间
+# 新上线了节点、或原来失败的节点恢复了，只按旧池子判断就会"明明还有货却退走了"。
+# 做法：**在真的要用降级节点之前**，对"当前所在的那个县"做一次限流的局部重扫：
+#   1. 先看池子里这个县还有没有可用节点（够用就根本不用扫）；
+#   2. 池子够新（REGION_RESCAN_MAX_AGE 内）就只用当前池子算，不重复联网；
+#   3. 否则拉一次节点（refresh_nodes_once，含 IP 富化），再看这个县有没有货；
+#   4. 有 -> 留在当前县；没有 -> 才算"真的没货"，继续按固定顺序往下退。
+# 每个县有冷却时间，9 条通道并发时只有一个真去拉，其它直接复用结果。
+# 注意：重扫一律在 node_pick_lock **之外**做 —— 否则 9 条通道会排队等一次网络拉取。
+# ----------------------------------------------------------------------------
+_rescan_lock = threading.Lock()          # 保护 _rescan_at（每个县上次重扫的时间）
+_rescan_at: dict[str, float] = {}
+_refresh_run_lock = threading.Lock()     # 保证同一时刻只有一个线程在真拉节点
+
+
+def _pool_snapshot() -> list[dict]:
+    with nodes_cache_lock:
+        return list(nodes_cache)
+
+
+def _region_free(pool: list[dict], key: str, taken: set[str] | frozenset = frozenset()) -> list[dict]:
+    """某个县当前"真能用"的节点：命中该县 + 未被占用 + 不在失败跳过期内。"""
+    key = (key or "").strip().upper()
+    if not key:
+        return []
+    return [n for n in pool
+            if (n.get("region_key") or "").strip().upper() == key
+            and n.get("ip") not in taken
+            and not is_node_skipped(n.get("ip", ""))]
+
+
+def rescan_region(country: str, region: str, need: int = 1,
+                  taken: set[str] | None = None, tag: str = "",
+                  wait: bool = False) -> dict:
+    """【降级前】重扫指定行政区，确认它是真没货，而不是"池子太旧"。
+
+    返回 {"ok", "found", "total", "new", "refreshed", "reason", "key", "name"}
+      ok        True = 当前地区仍有可用节点，调用方应当**不要**降级
+      found     重扫后该县可用节点数
+      total     重扫后该县节点总数（含被占用/被跳过的，用于说明"有节点但都不可用"）
+      new       本次刷新新拉到的该县节点数（0 表示没发现新节点）
+      refreshed 是否真的联网拉了一次（False = 池子还新鲜 / 冷却中 / 被禁用）
+      reason    enough / found / none / cooldown / busy / disabled / no_target / failed
+    """
+    res = {"ok": False, "found": 0, "total": 0, "new": 0, "refreshed": False,
+           "reason": "", "key": "", "name": ""}
+    if not REGION_RESCAN_ENABLED:
+        res["reason"] = "disabled"
+        return res
+    tgt = region_target(country, region)
+    if not tgt:
+        res["reason"] = "no_target"
+        return res
+    key = (tgt.get("key") or "").strip().upper()
+    res["key"], res["name"] = key, tgt.get("name") or region
+    taken = set(taken or ())
+
+    def tally(pool: list[dict]) -> tuple[int, int]:
+        in_region = [n for n in pool
+                     if (n.get("region_key") or "").strip().upper() == key]
+        return len(_region_free(pool, key, taken)), len(in_region)
+
+    pool = _pool_snapshot()
+    found, total = tally(pool)
+    res["found"], res["total"] = found, total
+    if found >= max(1, need):                    # 池子里还有货，根本不需要重扫
+        res["ok"], res["reason"] = True, "enough"
+        return res
+
+    now = time.time()
+    ck = f"{(country or '').strip()}|{key}"
+    with _rescan_lock:
+        if now - _rescan_at.get(ck, 0.0) < REGION_RESCAN_COOLDOWN:
+            res["reason"] = "cooldown"           # 刚扫过还是没货，别反复拉
+            return res
+        _rescan_at[ck] = now                      # 先占位，防并发通道同时开拉
+
+    who = f"[rescan {tag}]" if tag else "[rescan]"
+    refreshed = False
+    if (time.time() - _nodes_refreshed_at) > REGION_RESCAN_MAX_AGE:
+        got = (_refresh_run_lock.acquire(timeout=REGION_RESCAN_WAIT) if wait
+               else _refresh_run_lock.acquire(blocking=False))
+        if not got:
+            # 别的通道正在拉：单通道路径不等（等一次网络拉取会拖慢连接），
+            # 直接用当前池子算结论；等它拉完，下一条通道自然用上新池子。
+            res["reason"] = "busy"
+        else:
+            try:
+                if (time.time() - _nodes_refreshed_at) > REGION_RESCAN_MAX_AGE:
+                    before = {n.get("id") for n in _pool_snapshot() if n.get("id")}
+                    refresh_nodes_once("rescan")
+                    refreshed = True
+                    after = _pool_snapshot()
+                    new_ids = {n.get("id") for n in after if n.get("id")} - before
+                    res["new"] = sum(1 for n in after
+                                     if n.get("id") in new_ids
+                                     and (n.get("region_key") or "").strip().upper() == key)
+            except Exception as e:               # noqa: BLE001 - 重扫失败不能阻断选节点
+                res["reason"] = "failed"
+                log(f"{who} {country} {res['name']} 重扫失败（{e}），沿用当前节点池继续判断")
+            finally:
+                _refresh_run_lock.release()
+    res["refreshed"] = refreshed
+    found, total = tally(_pool_snapshot())
+    res["found"], res["total"] = found, total
+    res["ok"] = found >= 1
+
+    if res["ok"]:
+        res["reason"] = "found"
+        if found >= max(1, need):
+            extra = f"（新上线 {res['new']} 个）" if res["new"] else ""
+            log(f"{who} {country} {res['name']} 重扫后又有了 {found} 个可用节点{extra}，"
+                f"本次不降级，继续留在{res['name']}")
+        else:
+            extra = f"，其中新上线 {res['new']} 个" if res["new"] else ""
+            log(f"{who} {country} {res['name']} 重扫后可用 {found} 个{extra}"
+                f"（需要 {need} 个），先用掉这些，剩下的再按固定顺序递补")
+    else:
+        if res["reason"] not in ("busy", "failed"):
+            res["reason"] = "none"
+        if refreshed:
+            log(f"{who} {country} {res['name']} 重扫后仍然没有可用节点"
+                f"（池内 {total} 个，全部被占用或刚失败被跳过），按固定顺序递降")
+    return res
+
+
+def _pick_taken(exclude_ch: "Channel | None" = None,
+                exclude_ips: set | None = None) -> set[str]:
+    taken = occupied_ips(exclude_ch)
+    if exclude_ips:
+        taken |= set(exclude_ips)
+    return taken
+
+
+def _maybe_rescan_for_pick(country: str, tgt: dict, lock_key: str,
+                           exclude_ch: "Channel | None" = None,
+                           exclude_ips: set | None = None) -> dict | None:
+    """"这条通道要降级了吗？" —— 是的话先在**当前所在的县**上重扫一次。
+
+    当前所在县 = region_lock（已经退到的位置）优先，否则就是目标县。
+    这一步很关键：用户要求"东京都又有新 IP 也不切回"，所以重扫的必须是
+    锁定后的那个县，不能因为东京都有货就把通道拉回去。
+    """
+    cur = (lock_key or (tgt.get("key") or "")).strip().upper()
+    if not cur:
+        return None
+    taken = _pick_taken(exclude_ch, exclude_ips)
+    if _region_free(_pool_snapshot(), cur, taken):     # 还有可用的，不用扫
+        return None
+    who = f"CH{exclude_ch.index}" if exclude_ch is not None else "pick"
+    return rescan_region(country, cur, need=1, taken=taken, tag=who, wait=False)
 
 
 # 档位常量：优先链用 0..N（数字=链上第几位），其余用大一点的固定值，
@@ -1629,6 +1800,19 @@ def region_supply(country: str, ip_type: str = "") -> list[dict]:
     return rows
 
 
+def _plan_taken(targets: list["Channel"]) -> set[str]:
+    """规划时要排除的已占 IP：不包含本次要重新分配的通道（它们原来的 IP 可以回收）。"""
+    target_ids = {c.index for c in targets}
+    out: set[str] = set()
+    for c in channels:
+        if c.index in target_ids:
+            continue
+        ip = c.reserved_ip or c.node_ip
+        if ip and (c.reserved_ip or c.state in ("connected", "connecting")):
+            out.add(ip)
+    return out
+
+
 def build_assign_plan(targets: list["Channel"], mode: str = "country",
                       ip_type: str = "", country: str = "",
                       fill: bool = False, region: str = "") -> dict:
@@ -1648,6 +1832,22 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
     """
     want_country = (country or "").strip()      # mode=same 时指定的固定国家
     want_region = (region or "").strip()        # mode=same 时可再指定行政区（县/州）
+
+    # —— 降级前先重扫当前地区：池子里这个县不够用时，先拉一次节点看看有没有新上线 ——
+    # 这一步必须在下面 snapshot pool 之前做，否则重扫到的新节点进不了本次规划。
+    # 预览（dry_run）也走这里：用户在面板上点"预览"时看到的降级，必须是"真的没货"。
+    rescan_info: dict | None = None
+    free_before = 0
+    if mode == "same" and want_country and want_region:
+        tgt0 = region_target(want_country, want_region)
+        if tgt0:
+            taken0 = _plan_taken(targets)
+            free_before = len(_region_free(_pool_snapshot(), tgt0.get("key"), taken0))
+            if free_before < max(1, len(targets)):
+                rescan_info = rescan_region(want_country, want_region,
+                                            need=len(targets), taken=taken0,
+                                            tag="plan", wait=True)
+
     with nodes_cache_lock:
         pool = list(nodes_cache)
     warnings: list[str] = []
@@ -1667,13 +1867,7 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
 
     # 本次要重新分配的通道，它们原先占的 IP 可以回收
     target_ids = {c.index for c in targets}
-    used: set[str] = set()
-    for c in channels:
-        if c.index in target_ids:
-            continue
-        ip = c.reserved_ip or c.node_ip
-        if ip and (c.reserved_ip or c.state in ("connected", "connecting")):
-            used.add(ip)
+    used: set[str] = _plan_taken(targets)
 
     buckets: dict[str, list[dict]] = {}
     excl_buckets: dict[str, list[dict]] = {}    # 被默认排除的国家，只有用户显式点名才启用
@@ -1884,6 +2078,28 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
         for cname in distinct:
             if len(buckets[cname]) <= 2:
                 warnings.append(f"{cname} 只有 {len(buckets[cname])} 个节点，该通道掉线后可能无备选节点")
+    # 把"降级前重扫"的结果说出来 —— 否则用户看不出"这次为什么没退到埼玉"，
+    # 或者"为什么明明东京都还有节点却退走了"（后者说明重扫过也不够用）。
+    if rescan_info:
+        nm = rescan_info.get("name") or want_region
+        after = rescan_info.get("found", 0)
+        if rescan_info.get("ok") and rescan_info.get("new"):
+            tip = (f"降级前重扫了{nm}：新上线 {rescan_info['new']} 个节点，"
+                   f"可用数从 {free_before} 增加到 {after}，已优先留在该县")
+            if note:
+                note += "；" + tip
+            else:
+                warnings.insert(0, tip)
+        elif rescan_info.get("ok"):
+            warnings.insert(0, f"降级前重扫{nm}：可用节点从 {free_before} 增加到 {after}，"
+                               f"已优先使用，没有继续往下退")
+        elif rescan_info.get("reason") == "failed":
+            warnings.insert(0, f"降级前想重扫{nm}，但节点刷新失败，本次按现有节点池判断")
+        elif rescan_info.get("reason") == "none":
+            warnings.insert(0, f"降级前已重扫{nm}：确认当前没有可用节点"
+                               f"（池内 {rescan_info.get('total', 0)} 个，全部被占用或刚失败）")
+        # cooldown / busy / disabled：刚扫过或别的通道正在扫，不必再解释一遍
+
     return {"plan": plan, "warnings": warnings, "note": note,
             "countries": country_supply(ip_type),
             "regions": region_rows,
@@ -1927,6 +2143,19 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
     显式传 "" 表示忽略锁定（面板上重新指定县时就是这种情况）。
     锁定后重连只在这个县及其之后的顺位里挑，**不会因为原目标县恢复可用就切回去**。
     """
+    tgt = region_target(country, region) if region else None
+    if not tgt:
+        lock_key = ""
+    elif locked is None:
+        lock_key = (getattr(exclude_ch, "region_lock", "") or "") if exclude_ch else ""
+    else:
+        lock_key = locked or ""
+    lock_key = lock_key.strip().upper()
+    if tgt:
+        # 「要降级了吗？先扫一眼当前地区」—— 放在 node_pick_lock 之外，
+        # 否则 9 条通道会排队等一次网络拉取（最长几十秒）。
+        _maybe_rescan_for_pick(country, tgt, lock_key, exclude_ch, exclude_ips)
+
     with node_pick_lock:
         taken = occupied_ips(exclude_ch)
         if exclude_ips:
@@ -1934,14 +2163,6 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
         base, typed = _country_candidates(country, ip_type)
         if not base and not country:      # 池子本身是空的；指定国家没节点时继续走下面的"放宽"
             return None
-        tgt = region_target(country, region) if region else None
-        if not tgt:
-            lock_key = ""
-        elif locked is None:
-            lock_key = (getattr(exclude_ch, "region_lock", "") or "") if exclude_ch else ""
-        else:
-            lock_key = locked or ""
-        lock_key = lock_key.strip().upper()
 
         def usable(pool: list[dict]) -> list[dict]:
             # 刚连不上的节点（短期跳过内）先不选，避免同一轮反复去撞同一个死节点。
@@ -2777,7 +2998,7 @@ function asRegionHint(){
   if(!row){el.textContent='';return}
   var chain=regionChainText(co,key);
   el.innerHTML='该县可用 <b style="color:'+(row.free>=need?'#22c55e':'#f59e0b')+'">'+row.free
-    +'</b> 个'+(row.free>=need?'':('，不够 '+need+' 条：会自动就近递补'))
+    +'</b> 个'+(row.free>=need?'':('，不够 '+need+' 条：降级前会先重扫本县，确实没有才递补'))
     +(chain?('<div style="margin-top:2px;color:#6b7280">固定顺序：'+esc(chain)+' → 其它地区由近到远</div>'):'');
 }
 function asModeUI(){
@@ -2864,6 +3085,7 @@ async function previewAssign(){
     if(d.region_chain&&d.region_chain.length>1){
       h+='<div style="margin-top:6px;font-size:11px;color:#6b7280">固定递补顺序：'
         +esc(d.region_chain.join(' → '))+' → 其它地区由近到远；'
+        +'每退一步之前都会重扫一次当前县，有新上线的节点就留在原县；'
         +'降级后按落点锁定该县，目标县恢复可用也不会切回。</div>';
     }
     if(d.note){

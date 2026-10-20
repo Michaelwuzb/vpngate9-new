@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 SRC = os.path.dirname(os.path.abspath(__file__))
 
@@ -63,6 +64,10 @@ for f in sorted(n for n in os.listdir(FIX) if n.endswith(".py")):
 sys.path.insert(0, WORK)
 M = importlib.import_module("vpngate9_multi")
 G = importlib.import_module("region_geo")
+
+# 本文件测的是纯排序，默认把"降级前重扫"关掉（否则池子里该县没货时会真去拉节点）。
+# [12] 里单独打开，并把 refresh_nodes_once 打桩成"换一个池子"，全程不联网。
+M.REGION_RESCAN_ENABLED = False
 
 # ============ [1] 行政区名归一 ============
 log("\n[1] 行政区名多写法归一")
@@ -294,6 +299,107 @@ M.save_channels()
 saved = json.loads(M.CHANNELS_FILE.read_text(encoding="utf-8"))
 check("channels.json 带 region_lock", saved["3"].get("region_lock") == "JP-12", str(saved.get("3")))
 check("状态接口带 region_lock", ch.to_dict().get("region_lock") == "JP-12")
+
+# ============ [12] 降级前重扫当前地区 ============
+log("\n[12] 降级前先重扫当前地区：有新节点就不切换")
+
+
+def stub_refresh(new_pool, calls=None):
+    """把 refresh_nodes_once 换成"直接换一个节点池"，不联网。"""
+    def _f(tag="fetch"):
+        if calls is not None:
+            calls.append(tag)
+        M.nodes_cache = list(new_pool)
+        M._nodes_refreshed_at = time.time()
+        return {"total": len(new_pool), "new": 0, "new_ids": [],
+                "baseline": False, "source": "stub"}
+    return _f
+
+
+def reset_rescan():
+    M.REGION_RESCAN_ENABLED = True
+    M._rescan_at.clear()
+    M._nodes_refreshed_at = 0.0
+
+
+log("\n[12a] 东京都对池子里 0 个 -> 重扫发现新上线的东京都节点，不降级")
+before = [mk("10.10.1.1", "JP-11"), mk("10.10.2.1", "JP-14")]
+after = before + [mk("10.10.0.1", "JP-13"), mk("10.10.0.2", "JP-13")]
+chs = set_pool(before)
+reset_rescan()
+calls: list[str] = []
+M.refresh_nodes_once = stub_refresh(after, calls)
+n = M.get_best_node_for_country("Japan", "", exclude_ch=chs[0], region="JP-13")
+check("重扫到新节点后留在东京都（不降级）",
+      (n or {}).get("region_key") == "JP-13", str(n and n.get("region_key")))
+check("确实重扫了一次节点池", calls == ["rescan"], str(calls))
+check("新池子已生效", len(M.nodes_cache) == 4, str(len(M.nodes_cache)))
+
+log("\n[12b] 同一个县冷却期内不再重复拉节点")
+M.nodes_cache = list(before)
+chs = set_pool(before)
+calls.clear()
+M._nodes_refreshed_at = 0.0          # 池子"很旧"，只靠冷却挡住第二次拉取
+n = M.get_best_node_for_country("Japan", "", exclude_ch=chs[0], region="JP-13")
+check("冷却期内没有再拉节点", calls == [], str(calls))
+check("冷却期内照常就近降级", (n or {}).get("region_key") in ("JP-11", "JP-14"),
+      str(n and n.get("region_key")))
+
+log("\n[12c] 重扫后确认还是没货 -> 仍然按固定顺序递降（并说明已重扫过）")
+before = [mk("10.11.1.1", "JP-11"), mk("10.11.2.1", "JP-14"), mk("10.11.3.1", "JP-12")]
+chs = set_pool(before)
+reset_rescan()
+calls.clear()
+M.refresh_nodes_once = stub_refresh(before, calls)      # 刷新了，但依然没有东京都
+plan = M.build_assign_plan(chs, "same", "", "Japan", False, "JP-13")
+msgs = " ".join(plan["warnings"])
+check("仍然按 埼玉→神奈川→千叶 递降",
+      [p["region_key"] for p in plan["plan"]][:3] == ["JP-11", "JP-14", "JP-12"],
+      str([p["region_key"] for p in plan["plan"]]))
+check("规划时确实重扫过", calls == ["rescan"], str(calls))
+check("提示写明「降级前已重扫」", "已重扫" in msgs, msgs[:200])
+
+log("\n[12d] 重扫把东京都补够 9 个 -> 全部留在东京都，并在提示里说明")
+before = [mk("10.12.1.1", "JP-11"), mk("10.12.2.1", "JP-14")]
+after = [mk(f"10.12.0.{i}", "JP-13") for i in range(1, 10)] + before
+chs = set_pool(before)
+reset_rescan()
+calls.clear()
+M.refresh_nodes_once = stub_refresh(after, calls)
+plan = M.build_assign_plan(chs, "same", "", "Japan", False, "JP-13")
+check("9 条全部落在东京都",
+      [p["region_key"] for p in plan["plan"]] == ["JP-13"] * 9,
+      str([p["region_key"] for p in plan["plan"]]))
+combined = (plan.get("note") or "") + " " + " ".join(plan["warnings"])
+check("提示说明重扫到新上线节点", "新上线" in combined, combined[:220])
+check("这次没有任何降级警告", not any("就近降级" in w for w in plan["warnings"]),
+      " ".join(plan["warnings"])[:200])
+
+log("\n[12e] 已锁定在埼玉的通道：重扫的是埼玉，不是有货的东京都")
+before = [mk(f"10.13.0.{i}", "JP-13") for i in range(1, 6)] + [mk("10.13.1.1", "JP-14")]
+chs = set_pool(before)
+reset_rescan()
+calls.clear()
+M.refresh_nodes_once = stub_refresh(before, calls)      # 刷新后东京都一堆，埼玉仍然 0 个
+ch = chs[0]
+ch.force_country, ch.force_region, ch.region_lock = "Japan", "JP-13", "JP-11"
+n = M.get_best_node_for_country("Japan", "", exclude_ch=ch, region="JP-13")
+check("锁定埼玉时确实重扫了一次", calls == ["rescan"], str(calls))
+check("重扫后埼玉仍没货 -> 继续往后（神奈川），不回东京都",
+      (n or {}).get("region_key") == "JP-14", str(n and n.get("region_key")))
+
+log("\n[12f] VPNGATE_REGION_RESCAN=0 时完全不重扫")
+before = [mk("10.14.1.1", "JP-11")]
+chs = set_pool(before)
+reset_rescan()
+calls.clear()
+M.REGION_RESCAN_ENABLED = False
+M.refresh_nodes_once = stub_refresh(before + [mk("10.14.0.1", "JP-13")], calls)
+n = M.get_best_node_for_country("Japan", "", exclude_ch=chs[0], region="JP-13")
+check("关掉开关后不拉节点", calls == [], str(calls))
+check("关掉开关后按旧池子降级", (n or {}).get("region_key") == "JP-11",
+      str(n and n.get("region_key")))
+M.REGION_RESCAN_ENABLED = True
 
 print(f"\n=== 通过 {PASS} / {PASS + FAIL} ===")
 shutil.rmtree(WORK, ignore_errors=True)
