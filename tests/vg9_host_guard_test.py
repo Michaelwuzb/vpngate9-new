@@ -160,8 +160,13 @@ check("do_GET 一开始就做 Host 检查", "self.reject_host()" in get_body, ge
 check("do_POST 一开始就做 Host 检查", "self.reject_host()" in post_body, post_body[:120])
 check("检查排在鉴权之前（IP 直连连登录页都不给）",
       get_body.index("reject_host") < len(get_body) - 1)
-check("403 页面写明该用哪个域名",
-      'url = f"https://{dom[0]}:{UI_PORT}/"' in SRC_MULTI)
+check("403 页面写明该用哪个域名", 'url = f"https://{main_dom}:{UI_PORT}/"' in SRC_MULTI)
+check("推荐域名用证书 CN（不是 SAN 排序第一个的 cli.）",
+      M.cert_primary_name(CERT) == "jp.example.com"
+      and M.ui_preferred_host() == "jp.example.com", M.ui_preferred_host())
+reset({"cert": CERT, "key": KEY, "self_signed": False, "source": "测试"})
+check("CN 不在白名单时退回白名单里最短的域名",
+      M.ui_preferred_host() in ("jp.example.com", "cli.example.com"), M.ui_preferred_host())
 check("403 页面带逃生阀用法（不然管理员会以为面板坏了）",
       "ALLOW_IP_FILE}" in SRC_MULTI and "touch" in SRC_MULTI)
 check("拒绝日志有节流（扫描器刷屏时不会打爆 journal）",

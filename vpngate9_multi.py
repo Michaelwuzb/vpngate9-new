@@ -3346,6 +3346,33 @@ def cert_dns_names(cert_path: str) -> frozenset:
         return frozenset()
 
 
+def cert_primary_name(cert_path: str) -> str:
+    """证书的 CN（主域名）。403 页面要推荐"用户平时用的那个域名"，
+    拿 SAN 排序第一个会推荐成 cli.xxx 这类附属域名，看着就不像正门。"""
+    try:
+        import ssl as _ssl
+        d = _ssl._ssl._test_decode_cert(cert_path)
+        for rdn in d.get("subject", ()):
+            for k, v in rdn:
+                if k == "commonName" and v:
+                    return v.strip().lower().rstrip(".")
+    except Exception:
+        pass
+    return ""
+
+
+def ui_preferred_host() -> str:
+    """给用户看的那个域名：证书 CN 优先（且必须真的在白名单里），否则取白名单里最短的。"""
+    allowed = ui_allowed_hosts()
+    if not allowed:
+        return ""
+    cn = cert_primary_name(str((_UI_TLS_INFO or {}).get("cert") or ""))
+    if cn and cn in allowed:
+        return cn
+    return sorted(allowed, key=lambda x: (len(x), x))[0]
+
+
+
 def ui_allowed_hosts() -> frozenset:
     """面板允许的 Host 白名单。空集 = 不限制（HTTP / 自签证书 / 逃生阀打开时）。
 
@@ -3422,10 +3449,10 @@ class Handler(BaseHTTPRequestHandler):
         if now - _ui_hosts_denied_at[0] >= 60:      # 节流，别让扫描器刷爆 journal
             _ui_hosts_denied_at[0] = now
             log(f"[UI] 拒绝用 IP/未知域名访问面板（Host: {self.headers.get('Host','')}）"
-                f"——请改用 {', '.join(sorted(ui_allowed_hosts()))}:{UI_PORT}；"
+                f"——请改用 {ui_preferred_host()}:{UI_PORT}；"
                 f"确需 IP 访问就 touch {DATA_DIR / ALLOW_IP_FILE}")
-        dom = sorted(ui_allowed_hosts())
-        url = f"https://{dom[0]}:{UI_PORT}/" if dom else f"https://<域名>:{UI_PORT}/"
+        main_dom = ui_preferred_host()
+        url = f"https://{main_dom}:{UI_PORT}/" if main_dom else f"https://<域名>:{UI_PORT}/"
         body = (
             "<!doctype html><meta charset=utf-8><title>请用域名访问</title>"
             "<style>body{background:#141419;color:#e0e0e0;font:14px/1.7 system-ui;"
@@ -4201,8 +4228,9 @@ def main():
         log(f"[UI] https://{UI_HOST}:{UI_PORT}/  {ui_tls.cert_summary(_ui_tls_info)}")
         _allow = ui_allowed_hosts()
         if _allow:
-            log(f"[UI] 只接受域名访问：{', '.join(sorted(_allow))}:{UI_PORT}"
-                f"（用 IP 直连会返回 403；临时放开请 touch {DATA_DIR / ALLOW_IP_FILE}）")
+            log(f"[UI] 只接受域名访问：{ui_preferred_host()}:{UI_PORT}"
+                f"（全部放行域名：{', '.join(sorted(_allow))}；"
+                f"用 IP 直连会返回 403，临时放开请 touch {DATA_DIR / ALLOW_IP_FILE}）")
         else:
             log(f"[UI] 未限制访问域名（自签证书，或已打开 {ALLOW_IP_FILE}）")
     else:
