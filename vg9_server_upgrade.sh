@@ -271,7 +271,7 @@ do_tests() {
     [ -d "$INSTALL_DIR/tests" ] || { warn "没有 tests 目录，跳过"; return; }
     log "跑项目自带测试（在目标机上验环境）"
     local failed=0 t out
-    for t in vg9_stability_test.py vg9_assign_test.py vg9_seen_speed_test.py; do
+    for t in vg9_stability_test.py vg9_assign_test.py vg9_seen_speed_test.py vg9_region_test.py; do
         [ -f "$INSTALL_DIR/tests/$t" ] || continue
         out=$( cd "$INSTALL_DIR" && timeout 420 python3 "tests/$t" 2>&1 \
                | grep -E "^(===== 结果|PASS=)" | tail -1 )

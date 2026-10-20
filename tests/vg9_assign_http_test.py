@@ -263,9 +263,14 @@ try:
     js = os.path.join(WORK, "page.js")
     open(js, "w", encoding="utf-8").write("\n;\n".join(scripts))
     print(f"         script 块 {len(scripts)} 个，已抽出 {os.path.getsize(js)} 字节")
-    node = "C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2-3/node.exe"
-    r = subprocess.run([node, "--check", js], capture_output=True, text=True)
-    check("前端 JS 语法检查通过", r.returncode == 0, (r.stderr or "")[:300])
+    # node 用 PATH 里的即可；别写死绝对路径（换机器/换版本就找不到文件）
+    node = os.environ.get("NODE") or shutil.which("node") or "node"
+    if not (os.path.isfile(node) or shutil.which(node)):
+        check("前端 JS 语法检查通过", False, f"找不到 node（{node}），请装 Node.js 或设 NODE 环境变量")
+        r = None
+    else:
+        r = subprocess.run([node, "--check", js], capture_output=True, text=True)
+        check("前端 JS 语法检查通过", r.returncode == 0, (r.stderr or "")[:300])
 finally:
     srv.terminate()
     try:

@@ -34,6 +34,12 @@ python tests/vg9_https_test.py
 
 # 8. 失败节点短期跳过 + 国家无货时放宽到全池 + 通道指数退避（修"某通道无限重连"）  26 项
 python tests/vg9_node_pick_test.py
+
+# 9. 精确到县（都道府县）：名称归一 / 同县优先 / 就近降级 / 县供给表          44 项
+python tests/vg9_region_test.py
+
+# 10. 端到端：/api/regions + auto_assign?region= + 页面县选择器              31 项
+python tests/vg9_region_http_test.py
 ```
 
 依赖只有 Python 3 标准库和 Node.js（第 3、4 项需要）。Linux 上把 `python` 换成 `python3`。
@@ -48,5 +54,8 @@ python tests/vg9_node_pick_test.py
   （`os.listdir(FIX)` 取全部 `*.py`），所以以后新增模块不用回来改测试。
 - 后三个端到端用例会监听本地端口起临时实例，跑完自动关闭并清理。
 - 端到端用例把 `vpn_utils.enrich_ip_info` 打了桩，避免依赖外网 IP 富化接口。
+  **例外**：第 10 项（精确到县）必须用真实 IP 情报才有县数据，所以它不打桩；
+  拿不到县数据时会打印 `[SKIP]` 并跳过县相关断言，不会误报失败。
 - 第 5、6 项只测 HTTP 接口，会显式设 `VPNGATE_UI_TLS=off`（面板现在默认开 HTTPS，
   否则明文请求连不上）；HTTPS 本身由第 7 项覆盖。
+- 第 9 项是纯函数测试，用合成节点（自带经纬度）跑，**不联网**：行政区判定不该受节点源可用性影响。

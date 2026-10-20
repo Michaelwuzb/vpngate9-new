@@ -18,6 +18,7 @@ from typing import Any
 import vpn_utils
 import speedtest_utils
 import ui_tls
+import region_geo   # 国家级之下的行政区定位（都道府县 / 省 / 州）+ 就近降级
 
 # === Auth ===
 # 密码以 PBKDF2-SHA256 哈希存储(兼容旧版明文自动升级)；
@@ -263,6 +264,10 @@ class Channel:
         self.tun = f"tun{index}"
         self.proxy_port = PROXY_BASE_PORT + index
         self.force_country = ""
+        # 国家级之下再指定的行政区（日本=都道府县，如 JP-13 / 东京都）。
+        # 空 = 不限定，整个国家随便挑。留着用户填的原始值（键或名字都行），
+        # 每次选节点时再解析，这样面板显示的中文名和内部匹配键不会打架。
+        self.force_region = ""
         self.force_ip_type = ""
         self.enabled = False
         self.state = "disconnected"
@@ -270,6 +275,7 @@ class Channel:
         self.node_name = ""
         self.node_ip = ""
         self.node_country = ""
+        self.node_region = ""
         self.node_owner = ""
         self.node_location = ""
         self.node_ip_type = ""
@@ -299,9 +305,11 @@ class Channel:
 
     def to_dict(self) -> dict:
         d = {"index": self.index, "tun": self.tun, "proxy_port": self.proxy_port,
-             "force_country": self.force_country, "force_ip_type": self.force_ip_type, "enabled": self.enabled, "state": self.state,
+             "force_country": self.force_country, "force_region": self.force_region,
+             "force_ip_type": self.force_ip_type, "enabled": self.enabled, "state": self.state,
              "node_id": self.node_id, "node_name": self.node_name, "node_ip": self.node_ip,
-             "node_country": self.node_country, "node_owner": self.node_owner,
+             "node_country": self.node_country, "node_region": self.node_region,
+             "node_owner": self.node_owner,
              "node_location": self.node_location, "node_ip_type": self.node_ip_type,
              "node_ip_reason": self.node_ip_reason,
              "node_ip_confidence": self.node_ip_confidence,
@@ -348,6 +356,7 @@ def save_channels():
     for ch in channels:
         data[str(ch.index)] = {
             "force_country": ch.force_country,
+            "force_region": ch.force_region,
             "force_ip_type": ch.force_ip_type,
             "enabled": ch.enabled,
         }
@@ -987,6 +996,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         ch.node_name = node.get("hostname",node.get("ip",""))
         ch.node_ip = node.get("ip",node.get("remote_host",""))
         ch.node_country = node.get("country_long",node.get("country",""))
+        ch.node_region = node.get("region","")
         ch.node_owner = node.get("owner","")
         ch.node_location = node.get("location","")
         ch.node_ip_type = node.get("ip_type","")
@@ -1074,7 +1084,7 @@ def disconnect_channel(ch: Channel):
         stop_process(ch.process); ch.process = None
         cleanup_policy_routing(policy_table(ch.index))
         ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
-        ch.node_country = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
+        ch.node_country = ""; ch.node_region = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
         ch.node_ip_reason = ""; ch.node_ip_confidence = ""
         ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0; ch.connect_fails = 0
         release_slot(ch)
@@ -1374,9 +1384,180 @@ def country_supply(ip_type: str = "") -> dict[str, dict[str, int]]:
     return out
 
 
+def _country_match(n: dict, country: str) -> bool:
+    """节点是否属于指定国家。country 为空 = 不限。"""
+    if not country:
+        return True
+    key = country.strip().lower()
+    return (key in (n.get("country_long") or "").lower()
+            or key == (n.get("country") or "").strip().lower()
+            or key == (n.get("country_code") or "").strip().lower())
+
+
+# ============================================================================
+# 行政区级定位（都道府县 / 省 / 州）与"就近降级"
+# ----------------------------------------------------------------------------
+# 需求：要日本东京都的出口；东京都没 IP 就就近选，再没有再往下推。
+# 做法：
+#   1. vpn_utils 把 ip-api 的 region 归一成 region_key（日本为 JP-13 这种 JIS 码）
+#      + region_zone（关东等大区）+ 经纬度；
+#   2. 这里按 region_rank 分层排序 —— 同县(0) -> 同大区(1, 按距离) ->
+#      全国(2, 按距离) -> 完全没有坐标(3)；
+#   3. 排序后的第一条可用节点就是"最近的"；同一档且距离相近的几条里随机，
+#      既保持"就近优先"，又不让 9 条通道全挤在同一个节点上。
+# 这样"降级"不是几个 if 堆出来的，而是一条连续的排序链，日志里能说清降到了哪里。
+# ============================================================================
+
+def region_target(country: str, region: str) -> dict | None:
+    """把用户选/输入的行政区解析成目标描述。region 为空返回 None（=不限县）。
+
+    返回 {key, name, zone, lat, lon, preset}。非日本国家没有预置坐标时，
+    用该国同区节点的平均坐标估一个中心点，"就近"才有得算。
+    """
+    region = (region or "").strip()
+    if not region:
+        return None
+    with nodes_cache_lock:
+        pool = list(nodes_cache)
+    in_country = [n for n in pool if _country_match(n, country)]
+    cc = ""
+    for n in in_country:
+        if n.get("country_code"):
+            cc = str(n["country_code"])
+            break
+    tgt = region_geo.resolve_target(region, country, cc)
+    if not tgt:
+        return None
+    if tgt.get("lat") is None:
+        pts = [(n.get("lat"), n.get("lon")) for n in in_country
+               if (n.get("region_key") or "") == tgt.get("key")
+               and n.get("lat") is not None and n.get("lon") is not None]
+        if pts:
+            tgt["lat"] = sum(p[0] for p in pts) / len(pts)
+            tgt["lon"] = sum(p[1] for p in pts) / len(pts)
+    if not tgt.get("name"):
+        tgt["name"] = region
+    return tgt
+
+
+def region_rank(node: dict, tgt: dict) -> tuple[int, float]:
+    """节点相对目标行政区的排序键，越小越优先。
+
+    (0, 0)        同县/都道府县
+    (1, 距离)     同一大区（如关东）内，按距离
+    (2, 距离)     其它地区，按距离
+    (3, 0)        双方都没有坐标，只能靠原有质量排序
+    """
+    nk = (node.get("region_key") or "").strip().upper()
+    want = str(tgt.get("key") or "").strip().upper()
+    if want and nk and nk == want:
+        return (0, 0.0)
+    dist = region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
+                                   node.get("lat"), node.get("lon"))
+    zone = node.get("region_zone") or region_geo.zone_of_key(nk)
+    if tgt.get("zone") and zone and zone == tgt["zone"]:
+        return (1, dist if dist is not None else 1e6)
+    if dist is not None:
+        return (2, dist)
+    return (3, 0.0)
+
+
+def _region_gap_text(node: dict, tgt: dict) -> str:
+    """降级说明："千叶县（约 32km）"。用于日志和面板提示。"""
+    name = node.get("region") or "未知地区"
+    dist = region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
+                                   node.get("lat"), node.get("lon"))
+    return f"{name}（约 {dist:.0f}km）" if dist is not None else name
+
+
+def _region_spill_text(picked: list[tuple[str, dict]], tgt: dict,
+                       country: str) -> str:
+    """把"一部分落在目标县、其余就近降级"的结果写成一句人话。"""
+    in_country = [(c, n) for c, n in picked if c == country]
+    exact = [n for _, n in in_country if region_rank(n, tgt)[0] == 0]
+    used_regions: dict[str, int] = {}
+    first_near = None
+    for _, n in in_country:
+        if region_rank(n, tgt)[0] == 0:
+            continue
+        nm = n.get("region") or "未知地区"
+        used_regions[nm] = used_regions.get(nm, 0) + 1
+        if first_near is None:
+            first_near = n
+    head = (f"{country} {tgt['name']} 只有 {len(exact)} 个可用节点"
+            if exact else f"{country} {tgt['name']} 当前没有可用节点")
+    if not used_regions or set(used_regions) == {"未知地区"}:
+        # 整池都没有行政区数据（IP 情报还没跑完 / 查询失败）—— 这时候说"就近降级"
+        # 是假话，直说原因，别让人以为位置真的算过。
+        return (head + "；节点池里还没有县/州信息（IP 情报未完成或查询失败），"
+                "本次按原有质量顺序分配；稍后点「刷新」可补上县信息")
+    parts = [f"{nm}×{cnt}" for nm, cnt in
+             sorted(used_regions.items(), key=lambda kv: -kv[1])]
+    tail = f"；其余 {len(in_country) - len(exact)} 条已自动就近降级：{'、'.join(parts)}"
+    if first_near is not None:
+        gap = _region_gap_text(first_near, tgt)
+        if "约" in gap:
+            tail += f"；最近的是 {gap}"      # gap 自己已带括号，这里不要再套一层
+    return head + tail + "（出口 IP 仍互不重复）"
+
+
+def region_supply(country: str, ip_type: str = "") -> list[dict]:
+    """该国各行政区（县/州）的节点供给，用于面板下拉与提示。
+
+    日本会把 47 个都道府县**全部**列出来（即使当前 0 个节点）——
+    否则用户想选"东京都"却因为没有节点在下拉里找不到，就没法触发"就近降级"。
+    """
+    with nodes_cache_lock:
+        pool = list(nodes_cache)
+    used = set(occupied_map())
+    key_filter = ip_type if ip_type in IP_TYPE_KEYS else ""
+    cc = ""
+    out: dict[str, dict] = {}
+    for n in pool:
+        if not _country_match(n, country):
+            continue
+        if not cc and n.get("country_code"):
+            cc = str(n["country_code"])
+        if key_filter and (n.get("ip_type") or "") != key_filter:
+            continue
+        rkey = n.get("region_key") or ""
+        if not rkey:
+            continue
+        e = out.setdefault(rkey, {"key": rkey, "name": n.get("region") or rkey,
+                                  "zone": n.get("region_zone") or "",
+                                  "total": 0, "used": 0,
+                                  "_lat": [], "_lon": []})
+        e["total"] += 1
+        if n.get("ip") in used:
+            e["used"] += 1
+        if n.get("lat") is not None and n.get("lon") is not None:
+            e["_lat"].append(n["lat"])
+            e["_lon"].append(n["lon"])
+    for p in region_geo.options_for(country, cc):
+        e = out.setdefault(p["key"], {"key": p["key"], "name": p["name"],
+                                      "zone": p["zone"], "total": 0, "used": 0,
+                                      "_lat": [], "_lon": []})
+        e["name"] = p["name"]
+        e["zone"] = p["zone"]
+        e["lat"] = p["lat"]
+        e["lon"] = p["lon"]
+    rows = []
+    for e in out.values():
+        if "lat" not in e:
+            e["lat"] = sum(e["_lat"]) / len(e["_lat"]) if e["_lat"] else None
+            e["lon"] = sum(e["_lon"]) / len(e["_lon"]) if e["_lon"] else None
+        e.pop("_lat", None)
+        e.pop("_lon", None)
+        e["free"] = max(0, e["total"] - e["used"])
+        rows.append(e)
+    # 有可用节点的排前面（按可用数），其余按都道府县码顺序保持稳定
+    rows.sort(key=lambda x: (0 if x["total"] else 1, -x["free"], x["key"]))
+    return rows
+
+
 def build_assign_plan(targets: list["Channel"], mode: str = "country",
                       ip_type: str = "", country: str = "",
-                      fill: bool = False) -> dict:
+                      fill: bool = False, region: str = "") -> dict:
     """规划一组互不重复的出口节点。
 
     mode=country: 尽量让每条通道落在不同国家（按该国可用节点数从多到少分配）；
@@ -1384,15 +1565,21 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
     mode=same:    所有通道都固定到 country 指定的同一个国家/地区，只要求出口 IP 互不重复；
                   该国可用节点不够时默认只分配够用的条数（fill=True 才用其它国家补满）。
     mode=ip:      不限国家，只保证每条通道拿到一个不同的出口 IP。
+    region:       仅 mode=same 有意义 —— 在指定国家里再精确到行政区（日本=都道府县）。
+                  优先全部分到该县；该县可用节点不够时按"同大区 -> 全国按距离"就近递补，
+                  这就是需求里的"东京都没 IP 就就近，再没有往下推"。
 
     VPNGate 是志愿者网络，有节点的国家通常只有十来个，所以"9 个国家"经常凑不齐 ——
     真正能稳定做到的"9 个不同出口"是"IP 不重复"，这也是本函数的主目标。
     """
     want_country = (country or "").strip()      # mode=same 时指定的固定国家
+    want_region = (region or "").strip()        # mode=same 时可再指定行政区（县/州）
     with nodes_cache_lock:
         pool = list(nodes_cache)
     warnings: list[str] = []
     note = ""                                   # 成功时的正向说明（前端绿框展示）
+    region_rows: list[dict] = []                # 目标国家各行政区的供给（前端展示用）
+    tgt: dict | None = None                     # 目标行政区（都道府县/州）
     if not pool:
         return {"plan": [], "warnings": ["节点池为空，请先点「获取节点」"],
                 "countries": {}, "note": ""}
@@ -1480,16 +1667,44 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
                                  + (f"；当前在线有节点的国家/地区：{'、'.join(known)}"
                                     if known else "")]}
         need = len(targets)
-        while len(picked) < need:               # 先尽力把该国可用 IP 都占上
-            n = take(match)
-            if not n:
-                break
-            picked.append((match, n))
+        # —— 行政区（县/州）优先：同县 -> 同大区按距离 -> 全国按距离 ——
+        tgt = region_target(match, want_region) if want_region else None
+        if want_region and tgt is None:
+            warnings.append(f"没能识别「{want_region}」对应哪个县/州，本次在「{match}」全国范围内分配")
+        if want_region:
+            region_rows = region_supply(match, ip_type)
+        if tgt:
+            ranked = sorted(buckets[match], key=lambda n: region_rank(n, tgt))
+            for n in ranked:
+                if len(picked) >= need:
+                    break
+                if n.get("ip") in used:       # 已被其它通道占用/预占
+                    continue
+                used.add(n["ip"])
+                picked.append((match, n))
+        else:
+            while len(picked) < need:               # 先尽力把该国可用 IP 都占上
+                n = take(match)
+                if not n:
+                    break
+                picked.append((match, n))
         short = need - len(picked)
         if short <= 0:
-            note = (f"{need} 条通道全部使用 {match}"
-                    f"（该国共 {len(buckets[match])} 个节点），出口 IP 互不重复")
+            if tgt:
+                exact = sum(1 for c, n in picked
+                            if c == match and region_rank(n, tgt)[0] == 0)
+                note = (f"{need} 条通道全部使用 {match} {tgt['name']}"
+                        f"（该县当前 {sum(1 for n in buckets[match] if region_rank(n, tgt)[0] == 0)} 个节点）"
+                        f"，出口 IP 互不重复")
+                if exact < need:
+                    note = ""   # 有降级，绿色"全中"提示不合适，转成下面的黄色警告
+                    warnings.append(_region_spill_text(picked, tgt, match))
+            else:
+                note = (f"{need} 条通道全部使用 {match}"
+                        f"（该国共 {len(buckets[match])} 个节点），出口 IP 互不重复")
         elif fill:
+            if tgt:
+                warnings.append(_region_spill_text(picked, tgt, match))
             others = sorted([c for c in buckets if c != match],
                             key=lambda c: -free_count(c))
             while len(picked) < need:           # 轮转其它国家补满
@@ -1510,6 +1725,8 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
             if len(picked) < need:
                 warnings.append(f"全站可用节点也不够，仍有 {need - len(picked)} 条通道未分配")
         else:
+            if tgt:
+                warnings.append(_region_spill_text(picked, tgt, match))
             enough = [c for c in sorted(buckets, key=lambda c: -free_count(c))
                       if c != match and free_count(c) >= short]
             warnings.append(f"「{match}」当前只有 {need - short} 个未被其它通道占用的节点，"
@@ -1555,6 +1772,7 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
 
     plan = []
     for i, (cname, n) in enumerate(picked):
+        rk = region_rank(n, tgt)[0] if tgt else -1
         plan.append({
             "index": targets[i].index,
             "country": cname,
@@ -1565,6 +1783,15 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
             "ip_type": n.get("ip_type", ""),
             "ip_reason": n.get("ip_reason", ""),
             "country_total": len(buckets[cname]),
+            # 行政区：region 是节点实际所在县/州；region_tier 0=命中目标县，
+            # >=1 为降级档位，-1 表示本次没有指定目标县（不是"离得很远"）
+            "region": n.get("region", ""),
+            "region_key": n.get("region_key", ""),
+            "region_match": (rk == 0) if tgt else None,
+            "region_tier": rk,
+            "distance_km": (region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
+                                                    n.get("lat"), n.get("lon"))
+                            if tgt else None),
         })
 
     excl_left = sum(len(v) for v in excl_buckets.values()) - promoted
@@ -1584,7 +1811,9 @@ def build_assign_plan(targets: list["Channel"], mode: str = "country",
             if len(buckets[cname]) <= 2:
                 warnings.append(f"{cname} 只有 {len(buckets[cname])} 个节点，该通道掉线后可能无备选节点")
     return {"plan": plan, "warnings": warnings, "note": note,
-            "countries": country_supply(ip_type)}
+            "countries": country_supply(ip_type),
+            "regions": region_rows,
+            "region": tgt["name"] if tgt else ""}
 
 
 
@@ -1592,13 +1821,7 @@ def _country_candidates(country: str, ip_type: str = "") -> tuple[list[dict], li
     """返回 (该国全部候选, 再叠加 IP 类型过滤后的候选)。country 为空即全量池。"""
     with nodes_cache_lock:
         candidates = list(nodes_cache)
-    if not country:
-        base = candidates
-    else:
-        key = country.strip().lower()
-        base = [n for n in candidates
-                if key in (n.get("country_long") or "").lower()
-                or key == (n.get("country") or "").strip().lower()]
+    base = [n for n in candidates if _country_match(n, country)] if country else candidates
     typed = [n for n in base if n.get("ip_type") == ip_type] if ip_type else base
     return base, typed
 
@@ -1608,7 +1831,7 @@ node_pick_lock = threading.Lock()   # "读占用表 + 预占 IP" 必须原子，
 
 def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set = None,
                               exclude_ch: "Channel | None" = None,
-                              allow_reuse: bool = True) -> dict | None:
+                              allow_reuse: bool = True, region: str = "") -> dict | None:
     """挑一个出口节点，**优先挑没被其它通道占用的 IP**。
 
     选定后立刻写入 exclude_ch.reserved_ip 占位，保证并发场景下 9 条通道各拿一个不同 IP。
@@ -1616,6 +1839,10 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
 
     指定国家当前一个可用候选都没有时，会**自动放宽到全池**随便挑一个可用的
     （不拉黑、不死等），日志会写明"已自动放宽到 XX"。
+
+    region 非空时在这之前还有一层"行政区优先"：先用目标县/都道府县的节点；
+    该县没可用节点就按"同大区 -> 全国由近到远"递补 —— 这就是"东京都没 IP 就
+    就近选、再没有再往下推"。每次降级都会写日志，面板上也能看到落在哪个县。
     """
     with node_pick_lock:
         taken = occupied_ips(exclude_ch)
@@ -1624,6 +1851,7 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
         base, typed = _country_candidates(country, ip_type)
         if not base and not country:      # 池子本身是空的；指定国家没节点时继续走下面的"放宽"
             return None
+        tgt = region_target(country, region) if region else None
 
         def usable(pool: list[dict]) -> list[dict]:
             # 刚连不上的节点（短期跳过内）先不选，避免同一轮反复去撞同一个死节点。
@@ -1636,7 +1864,22 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
             # 只在最快的前若干节点里随机：既保证链路质量，又让各通道自然分散到不同节点
             return random.choice(free[:min(len(free), 12)])
 
-        node = choose(typed) or choose(base)          # 先按 IP 类型，再放宽类型
+        def choose_near(pool: list[dict]) -> dict | None:
+            """按 region_rank 取最近的；同档且距离相近的几条之间随机。"""
+            free = [n for n in usable(pool) if n.get("ip") not in taken]
+            if not free:
+                return None
+            ranked = sorted(free, key=lambda n: region_rank(n, tgt))
+            best = region_rank(ranked[0], tgt)
+            group = [n for n in ranked[:24]
+                     if region_rank(n, tgt)[0] == best[0]
+                     and abs(region_rank(n, tgt)[1] - best[1]) <= 50]
+            return random.choice(group) if len(group) > 1 else ranked[0]
+
+        if tgt:
+            node = choose_near(typed) or choose_near(base)   # 先按类型，再放宽类型
+        else:
+            node = choose(typed) or choose(base)          # 先按 IP 类型，再放宽类型
         relaxed_from = ""
         if node is None and country:
             # 指定的国家当前一个可用候选都没有（比如美国节点掉光了，或仅剩的死节点刚被跳过）。
@@ -1645,7 +1888,8 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
             all_base, all_typed = _country_candidates("", ip_type)
             all_base = [n for n in all_base if not is_excluded_country(n.get("country_long") or "")]
             all_typed = [n for n in all_typed if not is_excluded_country(n.get("country_long") or "")]
-            node = choose(all_typed) or choose(all_base)
+            node = (choose_near(all_typed) or choose_near(all_base)) if tgt \
+                else (choose(all_typed) or choose(all_base))
             if node is not None:
                 relaxed_from = country
         reused = False
@@ -1656,10 +1900,25 @@ def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set 
                 pool = usable([n for n in ab
                                if not is_excluded_country(n.get("country_long") or "")])
             if pool:
-                node = random.choice(pool)
+                if tgt:
+                    # 连"复用已占用的 IP"这一步也走就近排序，否则最后几条会随机
+                    # 跳到很远的地方，和"就近降级"的承诺不一致。
+                    node = sorted(pool, key=lambda n: region_rank(n, tgt))[0]
+                else:
+                    node = random.choice(pool)
                 reused = True
         if node is None:
             return None
+
+        # 行政区降级说明：只有真的没落在目标县时才提示，命中目标县就不刷日志
+        if tgt and not relaxed_from and region_rank(node, tgt)[0] != 0:
+            who = f"CH{exclude_ch.index}" if exclude_ch is not None else "?"
+            if not node.get("region"):
+                log(f"[pick {who}] {country} {tgt['name']}：节点还没有县信息可对照，"
+                    f"先按质量顺序选了 {node.get('ip', '')}（IP 情报完成后会自动按距离选）")
+            else:
+                log(f"[pick {who}] {country} {tgt['name']} 没有可用节点，"
+                    f"已就近降级到 {_region_gap_text(node, tgt)} 的节点 {node.get('ip', '')}")
 
         if relaxed_from:
             cname = node.get("country_long") or node.get("country") or "其它国家"
@@ -1720,7 +1979,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .dt.g2{background:#6b7280}
 .bd{font-size:12px;color:#9ca3af;line-height:1.7}
 .ll{color:#6b7280;font-size:11px}
-.ac{display:flex;gap:8px;margin-top:12px}
+.ac{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
 .tog{display:flex;align-items:center;gap:5px;font-size:11px;color:#6b7280;margin-top:8px;cursor:pointer;user-select:none}
 .tog input{cursor:pointer;accent-color:#818cf8}
 .ac select{flex:1;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;padding:6px 8px;font-size:12px;outline:none}
@@ -1792,6 +2051,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <option value="untested">未实测</option>
     </select>
     <select id="f_country"><option value="">所有国家</option></select>
+    <select id="f_region" title="按省/州/都道府县筛选"><option value="">所有县/州</option></select>
     <select id="f_type"><option value="">所有IP类型</option><option value="residential">住宅IP</option><option value="hosting">机房IP</option><option value="mobile">移动IP</option><option value="unknown">未知</option></select>
     <select id="f_sort" title="排序方式">
       <option value="">默认排序</option>
@@ -1816,7 +2076,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div style="overflow-x:auto">
   <table class="tbl" id="tbl"><thead><tr>
     <th style="width:26px"><input type="checkbox" class="cb" id="ckall" onchange="toggleAllNodes(this.checked)" title="全选/全不选"></th>
-    <th>状态</th><th>IP : 端口</th><th>物理位置</th><th>运营主体 / ISP</th><th>IP类型</th>
+    <th>状态</th><th>IP : 端口</th><th>物理位置</th><th>县/州</th><th>运营主体 / ISP</th><th>IP类型</th>
     <th>实测延迟</th><th>官方速度</th><th>实测带宽</th><th>发现时间</th><th>操作</th>
   </tr></thead><tbody id="tb"></tbody></table>
   </div>
@@ -1837,6 +2097,52 @@ var CH=[]; var CUR_NODE=null;
 var CUR_USER="";  // 当前登录账号，由 /api/status 回填，用于管理弹窗预填
 var _saved={}; // Save dropdown state across renders
 var _CS={},_CTRY=[];  // /api/status 带回的国家供给统计，供"全部通道用同一个国家"使用
+var _REG={};          // {国家: [{key,name,zone,total,free}]} 县级列表缓存（按需拉取）
+
+// ===== 行政区（县/都道府县/州）=====
+// 只有选定了国家才有意义；日本会返回全部 47 个（含 0 节点的），这样"目标县当前没节点"
+// 也能被选中，交给后端做"同县 -> 就近 -> 全国"的降级。
+function loadRegions(co,cb){
+  if(!co){ if(cb)cb([]); return; }
+  if(_REG[co]){ if(cb)cb(_REG[co]); return; }
+  fetch('/api/regions?country='+encodeURIComponent(co)).then(function(r){return r.json()})
+    .then(function(d){ _REG[co]=(d&&d.regions)||[]; if(cb)cb(_REG[co]); })
+    .catch(function(){ _REG[co]=[]; if(cb)cb([]); });
+}
+function regionNameOf(co,key){
+  if(!key) return '';
+  var rows=_REG[co]||[];
+  for(var i=0;i<rows.length;i++) if(rows[i].key===key) return rows[i].name;
+  return key;
+}
+// 通道卡片里的县级下拉：国家变了要重新填，且不能因为面板每 3 秒重绘就闪一下
+var _rsSig={};        // {通道号: "国家|当前县"} 记住上次填过的组合，避免重复重建
+function fillRegionSel(i,sig){
+  var sel=document.getElementById('rs_'+i); if(!sel) return;
+  var cs=document.getElementById('cs_'+i);
+  var co=(cs&&cs.value)||(CH[i]&&CH[i].force_country)||'';
+  var cur=_saved['rs_'+i]||((CH[i]&&CH[i].force_region)||'');
+  var want=co+'|'+cur;
+  if(!co){ sel.innerHTML='<option value="">不限县/州</option>'; sel.disabled=true; _rsSig[i]=''; return; }
+  sel.disabled=false;
+  if(sig!==true&&_rsSig[i]===want&&sel.options&&sel.options.length>1){ sel.value=cur; return; }
+  _rsSig[i]=want;
+  loadRegions(co,function(rows){
+    var h='<option value="">不限县/州</option>';
+    for(var k=0;k<rows.length;k++){
+      var r=rows[k];
+      var selAttr=(r.key===cur||r.name===cur)?' selected':'';
+      h+='<option value="'+esc(r.key)+'"'+selAttr+'>'+esc(r.name)+' · 可用 '+r.free+'/'+r.total+'</option>';
+    }
+    sel.innerHTML=h;
+    if(cur) sel.value=cur;
+  });
+}
+function onCtryPick(i){
+  var s=document.getElementById('cs_'+i); _saved['cs_'+i]=s?s.value:'';
+  _saved['rs_'+i]='';        // 换国家后旧县名多半不适用，清掉重新选
+  fillRegionSel(i,true);
+}
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(m){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
@@ -1871,6 +2177,7 @@ function render(d){
   for(var i=0;i<_nCh;i++){
     var el=document.getElementById('cs_'+i);if(el)_saved['cs_'+i]=el.value;
     var el2=document.getElementById('ipt_'+i);if(el2)_saved['ipt_'+i]=el2.value;
+    var el3=document.getElementById('rs_'+i);if(el3)_saved['rs_'+i]=el3.value;
   }
   CH=d.channels; var g=document.getElementById('grid'),h='';
   for(var i=0;i<CH.length;i++){
@@ -1884,6 +2191,14 @@ function render(d){
     h+='<div class="bd"><div class="i"><span class="ll">出口IP</span><span>'+ (c.node_ip||'-') +'</span>'+ dupTag(c,d) +'</div>';
     var ctryShown=c.node_country||c.force_country||'';
     h+='<div class="i"><span class="ll">国家</span><span'+(c.node_country?'':' style="color:#6b7280"')+'>'+ (ctryShown||'-') +'</span></div>';
+    // 县/都道府县：已连接显示节点实际所在县；还没连上时显示"目标县"
+    var regShown=c.node_region||'';
+    var regWant=c.force_region?regionNameOf(c.force_country, c.force_region):'';
+    if(regShown||regWant){
+      var regTxt=regShown||('<span style="color:#6b7280">目标 '+esc(regWant||c.force_region)+'</span>');
+      var regCls=(regWant&&regShown&&regShown!==regWant)?' style="color:#f59e0b"':'';
+      h+='<div class="i"><span class="ll">县/州</span><span class="ow"'+regCls+' title="'+(regWant?'目标：'+esc(regWant):'')+'">'+ regTxt +'</span></div>';
+    }
     h+='<div class="i"><span class="ll">位置</span><span style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ (c.node_location||'-') +'</span></div>';
     h+='<div class="i"><span class="ll">运营主体</span><span class="ow" title="'+c.node_owner+'">'+ (c.node_owner||'-') +'</span></div>';
     h+='<div class="i"><span class="ll">IP类型</span><span'+(ipc?' class="'+ipc+'"':'')+'>'+ (it||'-') +'</span></div>';
@@ -1908,7 +2223,7 @@ function render(d){
     }
     if(c.error) h+='<div class="i"><span class="ll">错误</span><span style="color:#ef4444">'+c.error+'</span></div>';
     h+='<label class="tog" title="关掉后该通道不再自动重连（等于手动断开）"><input type="checkbox" id="tog_'+c.index+'"'+(c.enabled?' checked':'')+' onchange="toggleChannel('+c.index+')">守护自动重连</label>';
-    h+='</div><div class="ac"><select id="cs_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
+    h+='</div><div class="ac"><select id="cs_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+' onchange="onCtryPick('+c.index+')">';
     h+='<option value="">自动选择</option>';
     if(d.countries) for(var j=0;j<d.countries.length;j++){
       var co=d.countries[j];
@@ -1918,6 +2233,10 @@ function render(d){
       h+='<option value="'+co+'"'+sel+'>'+lb+'</option>';
     }
     h+='</select>';
+    // 县级下拉：只在选了国家之后才有意义；该县没可用节点时后端会自动就近降级，
+    // 所以这里不做"没节点就禁用"，否则用户永远触发不了降级。
+    h+='<select id="rs_'+c.index+'" title="精确到县/都道府县：该县没有可用节点时自动就近降级"'+(c.state==='connecting'?' disabled':'')+' style="flex:0 0 auto;max-width:118px">';
+    h+='<option value="">不限县/州</option></select>';
     var savedIpt=_saved['ipt_'+c.index]||'';
     h+='<select id="ipt_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
     h+='<option value="">全部IP</option><option value="residential"'+(savedIpt==='residential'||c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
@@ -1930,6 +2249,7 @@ function render(d){
     h+='</div></div>';
   }
   g.innerHTML=h;
+  for(var i=0;i<CH.length;i++) fillRegionSel(i);   // 国家已定但县列表是异步拉的
   var ncEl=document.getElementById('nc');
   if(ncEl){
     ncEl.textContent='节点: '+(d.node_count||0)
@@ -1957,7 +2277,9 @@ async function toggleChannel(i){
 async function connectAuto(i){
   var s=document.getElementById('cs_'+i);var c=s?s.value:'';
   var t=document.getElementById('ipt_'+i);var ip=t?t.value:'';
-  await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(c)+'&ip_type='+encodeURIComponent(ip),{method:'POST'});
+  var rg=document.getElementById('rs_'+i);var reg=rg?rg.value:'';
+  await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(c)
+    +'&region='+encodeURIComponent(reg)+'&ip_type='+encodeURIComponent(ip),{method:'POST'});
   setTimeout(rf,500)}
 async function fetchNodes(){
   document.getElementById('rc').textContent='获取中...';
@@ -2032,9 +2354,12 @@ function checkedIds(){
 async function refreshNodes(){
   var st=document.getElementById('f_status').value;
   var ct=document.getElementById('f_country').value;
+  var rg=document.getElementById('f_region');
+  var rv=rg?rg.value:'';
   var tp=document.getElementById('f_type').value;
   var so=document.getElementById('f_sort').value;
-  var q='?filter='+st+'&country='+encodeURIComponent(ct)+'&ip_type='+encodeURIComponent(tp)+'&sort='+so;
+  var q='?filter='+st+'&country='+encodeURIComponent(ct)+'&region='+encodeURIComponent(rv)
+       +'&ip_type='+encodeURIComponent(tp)+'&sort='+so;
   try{
     var r=await fetch('/api/nodes'+q); var d=await r.json();
     var tb=document.getElementById('tb'),h='';
@@ -2049,6 +2374,7 @@ async function refreshNodes(){
       h+='<td><span class="sta '+av+'">'+avt+'</span></td>';
       h+='<td>'+newTag+n.ip+':'+n.port+'</td>';
       h+='<td class="ow" title="'+esc(n.location)+'">'+(n.location||'-')+'</td>';
+      h+='<td class="ow" title="'+(n.region?(esc(n.region)+(n.region_zone?'（'+esc(n.region_zone)+'）':'')):'未识别')+'">'+(n.region?esc(n.region):'<span style="color:#4b5563">-</span>')+'</td>';
       h+='<td class="ow" title="'+esc(n.owner)+'">'+(n.owner||'-')+'</td>';
       var tip=(n.ip_reason||'')+(confLabel(n.ip_confidence)?' · '+confLabel(n.ip_confidence):'')+(n.is_vpn_exit?' / VPN出口IP':'');
       tip=String(tip).replace(/["<>]/g,'');
@@ -2151,10 +2477,31 @@ async function loadCountries(){
     if(d.countries) for(var i=0;i<d.countries.length;i++){var o=document.createElement('option');o.value=d.countries[i];o.textContent=d.countries[i];sel.appendChild(o)}
   }catch(e){}
 }
-['f_status','f_country','f_type','f_sort'].forEach(function(id){
+// 国家筛选变化时，把"县/州"下拉换成该国可选的行政区（日本含全部 47 个）
+function loadRegionFilter(){
+  var co=document.getElementById('f_country').value;
+  var sel=document.getElementById('f_region'); if(!sel) return;
+  var cur=sel.value;
+  if(!co){ sel.innerHTML='<option value="">所有县/州</option>'; return; }
+  sel.innerHTML='<option value="">所有县/州</option>';
+  loadRegions(co,function(rows){
+    var h='<option value="">所有县/州</option>';
+    for(var i=0;i<rows.length;i++){
+      var r=rows[i];
+      h+='<option value="'+esc(r.key)+'">'+esc(r.name)+(r.total?('（可用 '+r.free+'/'+r.total+'）'):'（当前无节点）')+'</option>';
+    }
+    sel.innerHTML=h;
+    if(cur) sel.value=cur;
+  });
+}
+['f_status','f_type','f_sort'].forEach(function(id){
   var el=document.getElementById(id);
   if(el) el.addEventListener('change',refreshNodes);
 });
+var fc=document.getElementById('f_country');
+if(fc) fc.addEventListener('change',function(){loadRegionFilter();refreshNodes();});
+var fr=document.getElementById('f_region');
+if(fr) fr.addEventListener('change',refreshNodes);
 loadCountries(); refreshNodes();
 </script>
 
@@ -2198,8 +2545,18 @@ loadCountries(); refreshNodes();
   <div id="as_ctry_row" style="display:none;flex-direction:column;gap:6px;margin-bottom:10px">
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <span style="font-size:12px;color:#9ca3af">固定国家/地区</span>
-      <select id="as_ctry" onchange="previewAssign()" style="min-width:230px;padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none"></select>
+      <select id="as_ctry" onchange="fillAsRegions(true);asCtryHint();previewAssign()" style="min-width:230px;padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none"></select>
       <span id="as_ctry_hint" style="font-size:11px;color:#6b7280"></span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:12px;color:#9ca3af">精确到县/州</span>
+      <select id="as_region" onchange="asRegionHint();previewAssign()" style="min-width:230px;padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none"></select>
+      <span id="as_region_hint" style="font-size:11px;color:#6b7280"></span>
+    </div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6">
+      选定县/州后优先全部落在该县；该县可用节点不够时，按
+      <span style="color:#9ca3af">同大区 → 全国由近到远</span> 自动就近降级，并在下方列出实际落点。
+      日本可选全部 47 个都道府县（当前没有节点的也能选，选了就会就近递补）。
     </div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;color:#9ca3af">
       <input type="checkbox" id="as_fill" onchange="previewAssign()">
@@ -2257,10 +2614,49 @@ function asCtryHint(){
   var fr=freeOf(co);
   el.innerHTML='可用 <b style="color:'+(fr>=need?'#22c55e':'#f59e0b')+'">'+fr+'</b> 个，本次需要 '+need+' 条';
 }
+// "精确到县"下拉：跟着国家走。日本含全部 47 个（0 节点的也列出来，选了就走就近降级）
+var _asRegCo='';      // 上次填充时用的国家，避免每次预览都重建下拉把用户选择冲掉
+var _asRegPick='';    // 用户当前选中的县（国家变了要清空）
+function fillAsRegions(force){
+  var cs=document.getElementById('as_ctry'),sel=document.getElementById('as_region');
+  if(!cs||!sel)return;
+  var co=cs.value;
+  if(!co){sel.innerHTML='<option value="">不限县/州（全国任意）</option>';sel.disabled=true;_asRegCo='';return}
+  sel.disabled=false;
+  if(!force&&_asRegCo===co&&sel.options&&sel.options.length>1)return;
+  var cur=force?'':_asRegPick;
+  if(force&&_asRegCo!==co) cur='';     // 换国家了，之前选的县不适用
+  _asRegCo=co;
+  sel.innerHTML='<option value="">不限县/州（全国任意）</option>';
+  loadRegions(co,function(rows){
+    var h='<option value="">不限县/州（全国任意）</option>';
+    for(var i=0;i<rows.length;i++){
+      var r=rows[i];
+      h+='<option value="'+esc(r.key)+'"'+(r.key===cur?' selected':'')+'>'+esc(r.name)
+        +(r.zone?'（'+esc(r.zone)+'）':'')+' · 可用 '+r.free+'/'+r.total+'</option>';
+    }
+    sel.innerHTML=h;
+    if(cur)sel.value=cur;
+    asRegionHint();
+  });
+}
+function asRegionHint(){
+  var cs=document.getElementById('as_ctry'),rs=document.getElementById('as_region'),
+      el=document.getElementById('as_region_hint');
+  if(!cs||!rs||!el)return;
+  var co=cs.value,key=rs.value,need=needCount();
+  _asRegPick=key;
+  if(!co||!key){el.textContent='';return}
+  var rows=_REG[co]||[],row=null;
+  for(var i=0;i<rows.length;i++)if(rows[i].key===key)row=rows[i];
+  if(!row){el.textContent='';return}
+  el.innerHTML='该县可用 <b style="color:'+(row.free>=need?'#22c55e':'#f59e0b')+'">'+row.free
+    +'</b> 个'+(row.free>=need?'':('，不够 '+need+' 条：会自动就近递补'));
+}
 function asModeUI(){
   var m=asMode();
   document.getElementById('as_ctry_row').style.display=(m==='same')?'flex':'none';
-  if(m==='same'){fillCtryOptions();asCtryHint();}
+  if(m==='same'){fillCtryOptions();fillAsRegions();asCtryHint();}
 }
 function showAssign(){
   document.getElementById('assignModal').classList.add('show');
@@ -2279,10 +2675,12 @@ function asMode(){
 function asQ(){
   var same=asMode()==='same';
   var cs=document.getElementById('as_ctry');
+  var rs=document.getElementById('as_region');
   var fl=document.getElementById('as_fill');
   return 'mode='+asMode()+'&ip_type='+encodeURIComponent(document.getElementById('as_ipt').value)
        +'&count='+encodeURIComponent(document.getElementById('as_count').value)
        +'&country='+encodeURIComponent(same&&cs?cs.value:'')
+       +'&region='+encodeURIComponent(same&&rs?rs.value:'')
        +'&fill='+((same&&fl&&fl.checked)?'1':'0');
 }
 function asMsgA(t,ok){
@@ -2291,7 +2689,7 @@ function asMsgA(t,ok){
 }
 async function previewAssign(){
   var body=document.getElementById('as_body');
-  if(asMode()==='same'){fillCtryOptions();asCtryHint();}
+  if(asMode()==='same'){fillCtryOptions();fillAsRegions();asCtryHint();}
   body.innerHTML='<div style="color:#6b7280;font-size:12px">正在规划...</div>';
   try{
     var r=await fetch('/api/channels/auto_assign?dry_run=1&'+asQ(),{method:'POST'});
@@ -2301,17 +2699,36 @@ async function previewAssign(){
       body.innerHTML='<div style="color:#ef4444;font-size:12px">'+esc(d.error||'规划失败')+'</div>';return;
     }
     _assignPlan=d.plan;
+    var wantRegion=(document.getElementById('as_region')||{}).value||'';
     var h='<table style="width:100%;border-collapse:collapse;font-size:12px">';
-    h+='<thead><tr style="color:#6b7280;text-align:left"><th style="padding:6px 4px">通道</th><th>国家/地区</th><th>出口 IP</th><th>运营主体</th><th>该国节点</th></tr></thead><tbody>';
-    var cnt={};
+    h+='<thead><tr style="color:#6b7280;text-align:left"><th style="padding:6px 4px">通道</th><th>国家/地区</th><th>县/州</th><th>出口 IP</th><th>运营主体</th><th>该国节点</th></tr></thead><tbody>';
+    var cnt={},rcnt={},near=0;
     for(var i=0;i<d.plan.length;i++){
       var p=d.plan[i];cnt[p.country]=(cnt[p.country]||0)+1;
-      h+='<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 4px">CH'+p.index+'</td><td>'+esc(p.country)+'</td><td>'+esc(p.ip)+'</td><td>'+esc(p.owner||'-')+'</td><td>'+p.country_total+'</td></tr>';
+      // 县一列：命中目标县绿色；降级到别处标黄并给出距离，让用户一眼看出"没拿到东京都"。
+      // 没指定目标县时（region_tier=-1）只平铺显示，不要整列都标黄。
+      var rcell='-';
+      if(p.region){
+        if(!wantRegion||p.region_tier===0){
+          rcell=wantRegion?('<span style="color:#22c55e">'+esc(p.region)+'</span>'):esc(p.region);
+        }else{
+          near++;
+          rcnt[p.region]=(rcnt[p.region]||0)+1;
+          var dtxt=(p.distance_km!==null&&p.distance_km!==undefined)?('约 '+Math.round(p.distance_km)+'km'):'就近';
+          rcell='<span style="color:#f59e0b">'+esc(p.region)+'<span style="font-size:10px"> '+dtxt+'</span></span>';
+        }
+      }
+      h+='<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 4px">CH'+p.index+'</td><td>'+esc(p.country)+'</td><td>'+rcell+'</td><td>'+esc(p.ip)+'</td><td>'+esc(p.owner||'-')+'</td><td>'+p.country_total+'</td></tr>';
     }
     h+='</tbody></table>';
     var nC=Object.keys(cnt).length,shared=0;
     for(var k in cnt)if(cnt[k]>1)shared++;
     h+='<div style="margin-top:10px;font-size:11px;color:#6b7280">共 '+d.plan.length+' 条通道，覆盖 '+nC+' 个国家/地区，出口 IP 互不重复'+(shared?('（其中 '+shared+' 个国家被多条通道共用）'):'')+'。</div>';
+    if(wantRegion&&Object.keys(rcnt).length){
+      var parts=[];
+      for(var k2 in rcnt)parts.push(k2+'×'+rcnt[k2]);
+      h+='<div style="margin-top:6px;font-size:11px;color:#f59e0b">其中 '+near+' 条未能落在目标县，已就近递补：'+esc(parts.join('、'))+'</div>';
+    }
     if(d.note){
       h+='<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.25);color:#22c55e;font-size:11px;line-height:1.7">'+esc(d.note)+'</div>';
     }
@@ -2489,11 +2906,19 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/nodes":
             filter_type = params.get("filter",[""])[0]
             country = params.get("country",[""])[0]
+            region = params.get("region",[""])[0]
             ip_type = params.get("ip_type",[""])[0]
             sort_by = params.get("sort",[""])[0]
             now_ts = time.time()
             with nodes_cache_lock:
                 nodes = list(nodes_cache)
+            # 行政区过滤：参数可以是下拉传回来的键（JP-13），也可以是中文名（东京都）
+            region_keys: set[str] = set()
+            if region:
+                r_tgt = region_geo.resolve_target(region, country)
+                if r_tgt and r_tgt.get("key"):
+                    region_keys.add(str(r_tgt["key"]).upper())
+                region_keys.add(region.strip().upper())
             result = []
             for n in nodes:
                 ip = n.get("ip","")
@@ -2506,6 +2931,11 @@ class Handler(BaseHTTPRequestHandler):
                 first_seen = float(n.get("first_seen") or 0)
                 is_new = is_new_by_ttl(first_seen, now_ts)
                 if country and country.lower() not in n_country.lower(): continue
+                if region_keys:
+                    n_rk = (n.get("region_key") or "").strip().upper()
+                    n_rn = (n.get("region") or "").strip().upper()
+                    if not (n_rk in region_keys or n_rn in region_keys):
+                        continue
                 if ip_type and n_ip_type != ip_type: continue
                 if filter_type == "available" and not available: continue
                 if filter_type == "failed" and available: continue
@@ -2516,6 +2946,9 @@ class Handler(BaseHTTPRequestHandler):
                     "id": n.get("id",""), "ip": ip, "port": port,
                     "country_long": n_country, "available": available,
                     "location": n.get("location",""), "owner": n.get("owner",""),
+                    "region": n.get("region",""), "region_key": n.get("region_key",""),
+                    "region_zone": n.get("region_zone",""), "city": n.get("city",""),
+                    "lat": n.get("lat"), "lon": n.get("lon"),
                     "ip_type": n_ip_type, "asn": n.get("asn",""),
                     "ip_confidence": n.get("ip_confidence",""),
                     "ip_reason": n.get("ip_reason",""),
@@ -2543,6 +2976,19 @@ class Handler(BaseHTTPRequestHandler):
                 result.sort(key=lambda x: x["speed"], reverse=True)
             # 与节点池上限(300)对齐，避免"看不见的节点却被自动选中"
             self.send_json({"nodes":result[:300], "total":len(result)})
+        elif path == "/api/regions":
+            # 某国家下可选的行政区（县/都道府县/州）+ 各自节点数。
+            # 日本会把 47 个全部返回（0 节点的也在），这样"选了东京都但暂时没节点"
+            # 也能触发后端的就近降级，而不是在面板上根本选不到目标县。
+            country = (params.get("country",[""])[0] or "").strip()
+            ip_type = (params.get("ip_type",[""])[0] or "").strip()
+            if not country:
+                self.send_json({"ok": False, "error": "缺少 country 参数",
+                                "regions": []}, HTTPStatus.BAD_REQUEST)
+                return
+            rows = region_supply(country, ip_type)
+            self.send_json({"ok": True, "country": country, "regions": rows,
+                            "has_presets": bool(region_geo.options_for(country))})
         elif path == "/api/nodes/speedtest":
             # 批量真实测速的完整明细（含每个节点的成功/失败原因）
             with TASK_LOCK:
@@ -2750,11 +3196,14 @@ class Handler(BaseHTTPRequestHandler):
         #   mode=same    所有通道固定 country 指定的同一个国家(只要求 9 个出口 IP 互不相同)
         #   mode=ip      不限国家, 只保证 9 个出口 IP 互不相同
         #   fill=1       mode=same 时该国节点不够则用其它国家补满剩余通道
+        #   region       mode=same 时再精确到行政区(日本=都道府县, 如 JP-13 / 东京都)；
+        #                该县没可用节点会自动按"同大区 -> 全国由近到远"降级
         #   dry_run=1    只返回方案供确认, 不实际连线
         if path == "/api/channels/auto_assign":
             mode = (params.get("mode",["country"])[0] or "country").strip()
             ip_type = (params.get("ip_type",[""])[0] or "").strip()
             country = (params.get("country",[""])[0] or "").strip()
+            region = (params.get("region",[""])[0] or "").strip()
             fill = params.get("fill",["0"])[0] == "1"
             dry = params.get("dry_run",["0"])[0] == "1"
             scope = (params.get("count",[""])[0] or "").strip()
@@ -2777,12 +3226,14 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     items.append({"index":int(a.strip()), "node_id":b.strip(),
                                   "country":node.get("country_long",""),
+                                  "region":node.get("region",""),
+                                  "region_key":node.get("region_key",""),
                                   "ip":node.get("ip",""),
                                   "ip_type":node.get("ip_type","")})
                 if items:
                     res = {"plan": items, "warnings": []}
             if res is None:
-                res = build_assign_plan(targets, mode, ip_type, country, fill)
+                res = build_assign_plan(targets, mode, ip_type, country, fill, region)
             if not res["plan"]:
                 self.send_json({"ok":False, "error":"；".join(res["warnings"]) or "没有可用节点",
                                 "warnings":res["warnings"]}, HTTPStatus.SERVICE_UNAVAILABLE)
@@ -2790,13 +3241,15 @@ class Handler(BaseHTTPRequestHandler):
             if dry:
                 self.send_json({"ok":True, "dry_run":True, "plan":res["plan"],
                                 "warnings":res["warnings"], "note":res.get("note",""),
-                                "countries":res["countries"]})
+                                "countries":res["countries"],
+                                "regions":res.get("regions") or [],
+                                "region":res.get("region") or ""})
                 return
             applied, failed = [], []
             for i, item in enumerate(res["plan"]):
                 ch = channels[item["index"]]
                 node = get_node_by_id(item["node_id"]) or get_best_node_for_country(
-                    item["country"], item["ip_type"], exclude_ch=ch)
+                    item["country"], item["ip_type"], exclude_ch=ch, region=region)
                 if not node:
                     failed.append({"index":item["index"], "country":item["country"],
                                    "error":"节点已失效且无备选"})
@@ -2804,12 +3257,16 @@ class Handler(BaseHTTPRequestHandler):
                 # 先断开原连接，否则错峰重连会看到 connected 直接跳过
                 disconnect_channel(ch)
                 ch.force_country = item["country"]
+                # 记住"用户要的是哪个县"，而不是"这次恰好落到了哪个县" ——
+                # 这样通道掉线重连时会重新按"同县优先、没有就就近"再挑一次。
+                ch.force_region = region if mode == "same" else ""
                 ch.force_ip_type = ip_type          # 未指定类型则不限，重连时备选更多
                 ch.reserved_ip = node.get("ip","")
                 ch.enabled = True
                 save_channels()
                 threading.Thread(target=_delayed_connect, args=(ch, node, i * 3), daemon=True).start()
                 applied.append({"index":item["index"], "country":item["country"],
+                                "region":node.get("region",""),
                                 "ip":node.get("ip",""), "owner":node.get("owner",""),
                                 "ip_type":node.get("ip_type","")})
             log(f"[assign] mode={mode} 已下发 {len(applied)} 条通道的出口分配")
@@ -2835,6 +3292,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             node_id = params.get("node_id",[None])[0]
             country = params.get("country",[""])[0]
+            region = params.get("region",[""])[0]
             ip_type = params.get("ip_type",[""])[0]
             if node_id:
                 node = get_node_by_id(node_id)
@@ -2849,14 +3307,18 @@ class Handler(BaseHTTPRequestHandler):
                 if node_country: ch.force_country = node_country
                 node_iptype = node.get("ip_type","")
                 if node_iptype: ch.force_ip_type = node_iptype
+                # 手动挑的节点：把它的行政区也记下来，重连时尽量留在同一个县
+                ch.force_region = node.get("region_key") or node.get("region") or ""
                 ch.reserved_ip = node.get("ip","")
                 ch.enabled = True
                 save_channels()
             else:
-                node = get_best_node_for_country(country, ip_type, exclude_ch=ch)
+                node = get_best_node_for_country(country, ip_type, exclude_ch=ch,
+                                                 region=region)
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
                 # 显式提交就生效：country 传空表示"自动选择"，即不限国家
                 ch.force_country = country
+                ch.force_region = region
                 ch.force_ip_type = ip_type
                 ch.enabled = True
                 save_channels()
@@ -2911,6 +3373,7 @@ def channel_watchdog():
                     proc = ch.process
                     tun = ch.tun
                     force_country = ch.force_country
+                    force_region = ch.force_region
                     enabled = ch.enabled
                     last_connect_at = ch.last_connect_at
 
@@ -2967,9 +3430,11 @@ def channel_watchdog():
                             ch.reserved_ip = last.get("ip","")
                             log(f"[WD CH{ch.index}] Retry same node {last.get('ip','')}")
                     if node is None:
-                        node = get_best_node_for_country(force_country, ch.force_ip_type, exclude_ch=ch)
+                        node = get_best_node_for_country(force_country, ch.force_ip_type,
+                                                         exclude_ch=ch, region=force_region)
                     if node:
-                        log(f"[WD CH{ch.index}] Reconnect {force_country} {ch.force_ip_type}")
+                        log(f"[WD CH{ch.index}] Reconnect {force_country} "
+                            f"{force_region} {ch.force_ip_type}".replace("  ", " "))
                         delay = ch.index * 2  # 错峰，避免 9 条隧道同时抢带宽
                         threading.Thread(target=_delayed_connect, args=(ch, node, delay), daemon=True).start()
                     else:
@@ -3012,6 +3477,7 @@ def main():
     for ch in channels:
         c = ch_cfg.get(str(ch.index),{})
         ch.force_country = c.get("force_country","")
+        ch.force_region = c.get("force_region","")
         ch.force_ip_type = c.get("force_ip_type","")
         ch.enabled = c.get("enabled", bool(ch.force_country))
     proxy_failures = start_all_proxies()
@@ -3030,7 +3496,8 @@ def main():
             "守护进程会在下一轮重试；也可在面板点\"获取节点\"")
     for ch in channels:
         if ch.force_country:
-            node = get_best_node_for_country(ch.force_country, ch.force_ip_type, exclude_ch=ch)
+            node = get_best_node_for_country(ch.force_country, ch.force_ip_type,
+                                             exclude_ch=ch, region=ch.force_region)
             if node:
                 threading.Thread(target=connect_and_track, args=(ch, node), daemon=True).start()
                 time.sleep(2)

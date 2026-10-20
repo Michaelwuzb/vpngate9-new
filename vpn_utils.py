@@ -17,6 +17,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import region_geo   # 同目录：国家级之下的行政区归一（都道府县 / 省 / 州）
+
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
@@ -437,7 +439,12 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
 # 改动判定规则后请把 _CLS_VER 加一，旧缓存会自动失效重查。
 # ============================================================================
 _CLS_VER = 5
-_IP_API_FIELDS = "status,message,query,country,regionName,city,isp,org,as,asname,hosting,mobile,proxy"
+# 行政区（都道府县 / 省 / 州）字段的缓存版本。和 _CLS_VER 分开：
+# 旧缓存没有 geo_ver，会被判为"缺行政区数据"而重查一次，补齐 region/经纬度；
+# 这样不必因为加了个字段就把整池的类型判定结果也一起作废。
+_GEO_VER = 1
+_IP_API_FIELDS = ("status,message,query,country,countryCode,region,regionName,city,"
+                  "lat,lon,isp,org,as,asname,hosting,mobile,proxy")
 
 # 云 / 机房 / IDC 特征（机构名、ISP 名、AS 名里出现即判机房）
 HOSTING_KEYS: tuple[str, ...] = (
@@ -638,6 +645,17 @@ def _apply_cache_entry(node: dict[str, Any], cached: dict[str, Any]) -> None:
     node["ip_confidence"] = cached.get("ip_confidence", "")
     node["ptr"] = cached.get("ptr", "")
     node["is_vpn_exit"] = cached.get("is_vpn_exit", False)
+    # 行政区（省/州/都道府县）+ 坐标：region 是给面板显示的名字，
+    # region_key 是归一化后的匹配键（日本为 JP-13 这类 JIS 码），两者都由
+    # region_geo.canonicalize 生成，保证"节点侧"和"用户请求侧"用同一套口径。
+    node["country"] = cached.get("country", "")
+    node["country_code"] = cached.get("country_code", "")
+    node["region"] = cached.get("region", "")
+    node["region_key"] = cached.get("region_key", "")
+    node["region_zone"] = cached.get("region_zone", "")
+    node["city"] = cached.get("city", "")
+    node["lat"] = cached.get("lat")
+    node["lon"] = cached.get("lon")
 
 
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
@@ -653,9 +671,11 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         if not ip:
             continue
         cached = cache.get(ip)
-        # 缓存必须同时满足：判定算法版本一致 + 未过期。
-        # 旧缓存没有 cls_ver 字段，会判为失效并自动重查（修掉历史误判的关键）。
+        # 缓存必须同时满足：判定算法版本一致 + 未过期 + 带行政区数据。
+        # 旧缓存没有 cls_ver / geo_ver 字段，会判为失效并自动重查
+        # （前者修掉历史误判，后者补齐都道府县级定位所需的数据）。
         if (cached and cached.get("cls_ver") == _CLS_VER
+                and cached.get("geo_ver") == _GEO_VER
                 and now - cached.get("cached_at", 0) < 7 * 24 * 3600):
             _apply_cache_entry(node, cached)
             continue
@@ -677,12 +697,19 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             headers={"Content-Type": "application/json", "User-Agent": "vpngate-manager/3.0"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8", errors="replace"))
-        except Exception as e:
-            print(f"[enrich_ip_info] Query failed: {e}", flush=True)
-            continue
+        # 失败重试一次：这一轮拿不到行政区，面板上"精确到县"就整片是空的，
+        # 而 ip-api 免费额度是按分钟计的，偶发超时很常见，重试一次成本很低。
+        data = None
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    data = json.loads(response.read().decode("utf-8", errors="replace"))
+                break
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                print(f"[enrich_ip_info] Query failed: {e}", flush=True)
         if not isinstance(data, list):
             continue
         for item in data:
@@ -724,8 +751,20 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             # 也就是 unknown + 低置信度，不再改写成"按家宽处理"。
             ip_type, reason, conf = preliminary[qip]
 
+        # 行政区：把 ip-api 的 region（日本是 JIS 码 01~47）/regionName 归一成
+        # 匹配键 + 面板显示名。这一步是"定位到县"的数据基础，缺了它就只能按国家选。
+        try:
+            geo = region_geo.canonicalize(
+                item.get("country", ""), item.get("countryCode", ""),
+                str(item.get("region", "") or ""), item.get("regionName", "") or "",
+            )
+        except Exception:
+            geo = {"key": "", "name": item.get("regionName", "") or "", "zone": "",
+                   "lat": None, "lon": None}
+
         loc = " ".join(part for part in
-                       [item.get("country"), item.get("regionName"), item.get("city")] if part)
+                       [item.get("country"), geo.get("name") or item.get("regionName"),
+                        item.get("city")] if part)
 
         new_entries[qip] = {
             "owner": item.get("org") or item.get("isp") or "",
@@ -740,7 +779,17 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             # 注意：proxy=true 只代表"这是个 VPN/代理出口"，与家宽/机房无关，
             # 单独存成一个标记给面板显示，不再参与类型判定。
             "is_vpn_exit": bool(item.get("proxy")),
+            # --- 行政区与坐标（都道府县 / 省 / 州）---
+            "country": item.get("country", "") or "",
+            "country_code": (item.get("countryCode", "") or "").upper(),
+            "region": geo.get("name", "") or "",
+            "region_key": geo.get("key", "") or "",
+            "region_zone": geo.get("zone", "") or "",
+            "city": item.get("city", "") or "",
+            "lat": item.get("lat"),
+            "lon": item.get("lon"),
             "cls_ver": _CLS_VER,
+            "geo_ver": _GEO_VER,
             "cached_at": now,
         }
 
