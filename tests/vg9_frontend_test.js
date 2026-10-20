@@ -58,6 +58,7 @@ global.alert = () => {};
 global.confirm = () => true;
 global.CH = [];
 global._CS = {};
+global._CST = {};
 global._CTRY = [];
 // 顶层会执行 rf()，让 fetch 永远 pending，避免 render() 真的去碰 DOM
 global.fetch = () => new Promise(() => {});
@@ -105,6 +106,29 @@ check("够用时标绿", els.as_ctry_hint.innerHTML.indexOf("#22c55e") >= 0);
 els.as_ctry.value = "Thailand";
 asCtryHint();
 check("不够时标橙", els.as_ctry_hint.innerHTML.indexOf("#f59e0b") >= 0, els.as_ctry_hint.innerHTML);
+
+console.log("\n[3b] 选了「住宅」后，国家供给只算住宅节点");
+els.as_ipt.value = "residential";
+_CST = { residential: {
+  "Japan": { total: 27, residential: 27, mobile: 0, hosting: 0, unknown: 0, used: 2 },
+  "Korea Republic of": { total: 30, residential: 30, mobile: 0, hosting: 0, unknown: 0, used: 0 },
+  "Thailand": { total: 8, residential: 8, mobile: 0, hosting: 0, unknown: 0, used: 0 },
+  "China": { total: 1, residential: 1, mobile: 0, hosting: 0, unknown: 0, used: 1 },
+} };
+fillCtryOptions();
+let h2 = els.as_ctry.innerHTML;
+check("国家下拉用住宅口径（Japan 25/27，不是 42/42）",
+      h2.indexOf("Japan · 可用 25/27") >= 0, h2.slice(0, 160));
+check("没住宅的国家按住宅排到后面",
+      [...h2.matchAll(/value="([^"]+)"/g)].map(m => m[1])[0] === "Korea Republic of",
+      h2.slice(0, 160));
+els.as_ctry.value = "Japan";
+asCtryHint();
+check("提示写着只算住宅、机房不参与",
+      els.as_ctry_hint.innerHTML.indexOf("只算住宅 IP") >= 0
+      && els.as_ctry_hint.innerHTML.indexOf("机房等其它类型不参与") >= 0,
+      els.as_ctry_hint.innerHTML);
+els.as_ipt.value = "";
 
 console.log("\n[4] 模式切换时的显隐");
 radioMode = "same"; asModeUI();
@@ -182,8 +206,10 @@ check("显示当前正在测的节点", els.job_txt.textContent.indexOf("1.2.3.4
 check("测速中出现停止按钮", els.btnStop.style.display === "", els.btnStop.style.display);
 
 console.log("\n[10] 固定递补顺序提示（东京都 -> 埼玉 -> 神奈川 -> 千叶 -> 山梨）");
-_REG["Japan"] = [{ key: "JP-13", name: "东京都", zone: "关东", total: 10, free: 2 },
-                 { key: "JP-11", name: "埼玉县", zone: "关东", total: 3, free: 3 }];
+// 县列表缓存按「国家|IP类型」分开存：选了住宅就只统计住宅节点（机房不算可用）
+els.as_ipt.value = "";
+_REG["Japan|"] = [{ key: "JP-13", name: "东京都", zone: "关东", total: 10, free: 2 },
+                  { key: "JP-11", name: "埼玉县", zone: "关东", total: 3, free: 3 }];
 _REGCHAIN["Japan"] = { "JP-13": ["东京都", "埼玉县", "神奈川县", "千叶县", "山梨县"] };
 check("regionChainText 拼出固定顺序",
       regionChainText("Japan", "JP-13") === "东京都 → 埼玉县 → 神奈川县 → 千叶县 → 山梨县",
@@ -199,6 +225,20 @@ check("提示里写明该县不够时会自动递补",
       els.as_region_hint.innerHTML.indexOf("不够 9 条") >= 0, els.as_region_hint.innerHTML);
 check("提示里带固定顺序（面板能直接看出退到哪）",
       els.as_region_hint.innerHTML.indexOf("固定顺序") >= 0, els.as_region_hint.innerHTML);
+
+// 选了「住宅」后，同一个县的可用数必须只算住宅节点（机房不算有货）
+els.as_ipt.value = "residential";
+_REG["Japan|residential"] = [{ key: "JP-13", name: "东京都", zone: "关东", total: 0, free: 0 },
+                             { key: "JP-11", name: "埼玉县", zone: "关东", total: 3, free: 3 }];
+els.as_region.value = "JP-13";
+asRegionHint();
+check("选住宅后东京都按住宅口径算 0 个（不是不限类型的 2 个）",
+      /该县可用 <b[^>]*>0<\/b>/.test(els.as_region_hint.innerHTML), els.as_region_hint.innerHTML);
+check("提示写明只算住宅、机房不参与降级",
+      els.as_region_hint.innerHTML.indexOf("只算住宅 IP") >= 0
+      && els.as_region_hint.innerHTML.indexOf("机房不参与降级") >= 0,
+      els.as_region_hint.innerHTML);
+els.as_ipt.value = "";
 
 console.log(`\n===== 结果: ${PASS} 通过 / ${FAIL} 失败 =====`);
 process.exit(FAIL ? 1 : 0);

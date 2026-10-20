@@ -20,7 +20,7 @@ python tests/vg9_assign_test.py
 # 3. 前端 JS 语法 + 函数/元素/onclick 引用完整性（用 node --check）
 python tests/vg9_frontend_check.py
 
-# 4. 前端 DOM stub 单测（node，无需浏览器）                                 44 项
+# 4. 前端 DOM stub 单测（node，无需浏览器）                                 49 项
 node tests/vg9_frontend_test.js
 
 # 5. 端到端：起真实面板实例 + mock VPNGate 节点源 + 测速专用口            68 项
@@ -32,14 +32,17 @@ python tests/vg9_assign_http_test.py
 # 7. 面板 HTTPS（证书发现 / 自签 / 端到端 https）+ IP 类型未知值             63 项
 python tests/vg9_https_test.py
 
-# 8. 失败节点短期跳过 + 国家无货时放宽到全池 + 通道指数退避（修"某通道无限重连"）  26 项
+# 8. 失败节点短期跳过 + 国家无货时放宽到全池 + 通道指数退避（修"某通道无限重连"）  27 项
 python tests/vg9_node_pick_test.py
 
 # 9. 精确到县：名称归一 / 固定递补顺序 / 就近降级 / 锁定不回切 / 降级前重扫  77 项
 python tests/vg9_region_test.py
 
-# 10. 端到端：/api/regions + auto_assign?region= + 页面县选择器/顺序提示      38 项
+# 10. 端到端：/api/regions + auto_assign?region= + 页面县选择器/顺序提示      47 项
 python tests/vg9_region_http_test.py
+
+# 11. 指定 IP 类型后严格过滤：住宅模式下机房 IP 不参与降级/不顶替           51 项
+python tests/vg9_type_strict_test.py
 ```
 
 依赖只有 Python 3 标准库和 Node.js（第 3、4 项需要）。Linux 上把 `python` 换成 `python3`。
@@ -64,3 +67,6 @@ python tests/vg9_region_http_test.py
 - 第 9 项还覆盖"降级前重扫当前地区"：把 `refresh_nodes_once` 打桩成"换一个节点池"，
   因此仍是**不联网**的；默认先关掉重扫（`REGION_RESCAN_ENABLED=False`），
   只在第 12 组用例里单独打开，避免合成池子里该县没货时真去拉节点。
+- 第 11 项测的是"住宅模式下机房 IP 不参与"：东京都只剩机房时必须往埼玉/神奈川走，
+  全站没有住宅时必须拒绝分配而不是拿机房顶上。第 8 项的 A0 已经从"放宽类型"改成
+  这条新契约（行为变更是需求，不是回归）。

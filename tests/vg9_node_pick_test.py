@@ -112,6 +112,7 @@ def set_pool(items):
 
 
 US_DEAD = node("104.28.237.60", "United States", "hosting", "us-dead")
+US_OK = node("104.28.237.61", "United States", "residential", "us-ok")
 JP_OK = node("60.91.157.48", "Japan", "residential", "jp-ok")
 CN_NODE = node("203.0.113.77", "China", "residential", "cn-1")
 
@@ -122,14 +123,22 @@ head("A. 失败节点短期跳过（内存态，非黑名单）")
 
 set_pool([US_DEAD, JP_OK])
 n = M.get_best_node_for_country("United States", "residential")
-check("A0 前置：美国只有 hosting 节点时放宽类型仍能选到（原行为保留）",
-      bool(n) and n["ip"] == US_DEAD["ip"], str(n))
+# 2026-10 行为变更：指定 IP 类型后是严格模式 —— 美国只有机房节点时，不能为了让
+# "国家"不落空就放宽成机房，而是放宽**国家**（去日本找一个真住宅）。
+check("A0 类型严格：美国只有机房时，住宅模式选的是日本住宅（不是美国机房）",
+      bool(n) and n["ip"] == JP_OK["ip"], str(n))
+n0 = M.get_best_node_for_country("United States", "")
+check("A0b 不限类型时仍能选到美国机房（旧行为保留）",
+      bool(n0) and n0["ip"] == US_DEAD["ip"], str(n0))
 
 M.skip_node(US_DEAD["ip"], "隧道不通")
 check("A1 被跳过的节点不再被选中", M.is_node_skipped(US_DEAD["ip"]))
 
+# 让美国唯一一个住宅候选被跳过 -> 该国的"可用住宅"确实为 0，才会放宽国家
+set_pool([US_DEAD, US_OK, JP_OK])
+M.skip_node(US_OK["ip"], "隧道不通")
 n2 = M.get_best_node_for_country("United States", "residential")
-check("A2 指定国家唯一候选被跳过后 -> 放宽到别的国家可用节点，而不是返回 None（核心需求）",
+check("A2 指定国家的住宅候选被跳过后 -> 放宽到别的国家可用节点，而不是返回 None（核心需求）",
       bool(n2) and n2["ip"] == JP_OK["ip"], str(n2))
 
 check("A3 纯内存：不产生黑名单文件",
@@ -236,7 +245,8 @@ check("E1 重复告警按 NO_NODE_LOG_INTERVAL 节流",
       and "now - getattr(ch, \"no_node_at\", 0.0) >= NO_NODE_LOG_INTERVAL" in SRC_TXT)
 
 check("E2 原因写进 ch.error 供面板展示",
-      'ch.error = f"没有可用的出口节点（{want}）"' in SRC_TXT)
+      'ch.error = (' in SRC_TXT and '没有可用的{tl}出口节点' in SRC_TXT
+      and '已排除机房等其它类型' in SRC_TXT)
 
 check("E3 无节点日志已改为'全池'口径（不再说'该国家没有节点'）",
       "全池都没有可用出口节点" in SRC_TXT)

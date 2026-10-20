@@ -115,6 +115,15 @@ try:
     node_count = st.get("node_count", 0)
     check("节点池非空", node_count > 0, f"node_count={node_count}")
     print(f"         节点 {node_count} 个，国家 {len(st.get('countries', []))} 个")
+    # 面板选了「住宅」时，国家下拉要按住宅口径显示"可用 N/M"，这份数据从 /api/status 来
+    cst = st.get("country_stats_by_type") or {}
+    check("/api/status 带按 IP 类型分开的国家供给",
+          {"residential", "hosting", "mobile", "unknown"} <= set(cst), str(list(cst)))
+    cs_all = st.get("country_stats") or {}
+    if "Japan" in cs_all:
+        check("按类型供给与总供给口径一致（Japan 住宅数 = 总数里的 residential）",
+              cst["residential"]["Japan"]["total"] == cs_all["Japan"]["residential"],
+              f'{cst["residential"]["Japan"]["total"]} vs {cs_all["Japan"]["residential"]}')
 
     print("\n[3] /api/regions?country=Japan")
     code, txt = call("GET", "/api/regions?country=Japan")
@@ -135,6 +144,42 @@ try:
           f"东京都 可用 {by_key.get('JP-13', {}).get('free')}/{by_key.get('JP-13', {}).get('total')}")
     if not with_nodes:
         skip("东京都节点供给", "节点池里没有带行政区信息的日本节点（ip-api 不可用？）")
+
+    print("\n[3b] /api/regions?ip_type=residential：计数只算住宅")
+    code, txt = call("GET", "/api/regions?country=Japan&ip_type=residential")
+    d3 = json.loads(txt) if code == 200 else {}
+    check("住宅口径返回 200", code == 200, f"code={code}")
+    check("响应回显 ip_type", d3.get("ip_type") == "residential", str(d3.get("ip_type")))
+    r_rows = d3.get("regions") or []
+    check("同样 47 个都道府县", len(r_rows) == 47, str(len(r_rows)))
+    if with_nodes:
+        tot_all = sum(r.get("total", 0) for r in rows)
+        tot_res = sum(r.get("total", 0) for r in r_rows)
+        check("住宅计数不超过总数", tot_res <= tot_all, f"{tot_res} vs {tot_all}")
+        by_res = {r["key"]: r for r in r_rows}
+        check("每个县的住宅数都不超过该县总数",
+              all(by_res.get(k, {}).get("total", 0) <= v.get("total", 0)
+                  for k, v in by_key.items()),
+              str([(k, v.get("total"), by_res.get(k, {}).get("total"))
+                   for k, v in by_key.items() if v.get("total")]))
+        print(f"         东京都 全部 {by_key.get('JP-13', {}).get('total')} 个 / "
+              f"住宅 {by_res.get('JP-13', {}).get('total')} 个")
+    else:
+        skip("住宅/总数对比", "没有带县信息的节点")
+
+    print("\n[3c] 住宅模式规划：不能出现机房节点")
+    code, txt = call("POST",
+                     "/api/channels/auto_assign?dry_run=1&mode=same&country=Japan"
+                     "&region=JP-13&ip_type=residential&count=")
+    d4 = json.loads(txt) if code == 200 else {}
+    if code == 503:
+        # 全站没有住宅节点 -> 后端拒绝分配是**正确**行为（旧版会静默用机房顶上）
+        check("没有住宅节点时拒绝分配（而不是拿机房顶替）",
+              "已排除其它类型" in txt, txt[:160])
+    else:
+        check("住宅模式预览返回 200", code == 200, f"code={code} {txt[:160]}")
+        bad = [p for p in (d4.get("plan") or []) if p.get("ip_type") != "residential"]
+        check("方案里没有一条是机房/移动/未知", not bad, str(bad[:3]))
 
     print("\n[4] 缺参数/未知国家")
     code, _t = call("GET", "/api/regions")

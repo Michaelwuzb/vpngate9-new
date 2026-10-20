@@ -621,7 +621,7 @@ check("F6d 不筛选时 unknown 也计入 total",
 M.nodes_cache.clear()
 
 check("F6e '当前没有该类型节点' 的提示用中文而不是 unknown",
-      "ip_type_label(ip_type)" in src_multi)
+      "「{ip_type_label(tk)}」类型的节点" in src_multi)
 
 # ============================================================ G 安装脚本
 head("G. 安装脚本")
