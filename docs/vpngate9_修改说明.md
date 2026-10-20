@@ -1184,3 +1184,91 @@ def type_key(ip_type):
 回归：`vg9_node_pick_test.py` 的 A0 原本写的是"美国只有机房时放宽类型仍能选到"，
 本轮把这个断言改成正向契约（`类型严格：选日本住宅`），并补了 `A0b 不限类型时仍选美国机房`；
 `vg9_frontend_test.js` 的县级缓存键跟着改成 `国家|类型`，另加 2 项"住宅口径"断言。
+
+## 二十一、本轮：面板只接受域名访问（IP 直连 403）
+
+需求原话：「https://133.18.147.35:8787/ 这个可以关了」——确认后指
+「禁止用 IP 访问面板，只保留域名入口」。
+
+### 21.1 为什么这件事只能按 Host 头做
+
+面板监听 `0.0.0.0:8787`，域名和 IP 打在**同一个 socket** 上，端口层面根本分不出
+"你输的是 `jp.micwebsite.dpdns.org` 还是 `133.18.147.35`"。能区分的只有 HTTP 的 `Host` 头。
+
+顺带把预期说清楚，免得以为是安全加固的银弹：
+
+| 挡得住 | 挡不住 |
+|---|---|
+| 浏览器敲 `https://<IP>:8787/`（看到无意义的证书警告页） | `curl -H "Host: <域名>"` 的定向请求 |
+| 全网段扫描器按 IP 扫到 8787 就"发现一个面板" | 知道域名的人的暴力破解（这要靠登录口令） |
+
+真正的收益是**收敛暴露面**，不是访问控制。
+
+### 21.2 白名单从哪来：直接读证书
+
+不新增配置文件、不加环境变量、不改 systemd 单元（升级脚本会覆盖它），
+白名单**从面板正在用的那张证书的 SAN 里读**：
+
+```python
+def ui_allowed_hosts():
+    if (DATA_DIR / "allow_ip_host").exists():   # 逃生阀
+        return frozenset()
+    info = _UI_TLS_INFO or {}
+    if info.get("cert") and not info.get("self_signed"):
+        return cert_dns_names(info["cert"])     # ssl._ssl._test_decode_cert，只读 PEM 不发请求
+    return frozenset()                          # 空集 = 不限制
+```
+
+好处是随之自动更新：这台证书换成新域名、加了新 SAN，白名单跟着变，不用改代码。
+实测这台读出来是 `{jp.micwebsite.dpdns.org, cli.micwebsite.dpdns.org}`。
+
+判定规则（`host_denied`）：
+
+```
+Host 为空                  -> 放行（老脚本 / HTTP/1.0，宁松不锁死）
+Host 是 127.0.0.1/::1/localhost -> 放行（ml status / 守护 / 升级验收都打回环）
+Host 是纯 IP               -> 拒绝（白名单里只有域名，用 ipaddress 判）
+Host 是证书里的域名        -> 放行
+其它                       -> 拒绝
+```
+
+`Host` 的几种写法都归一了：`a.com:8787`、`[::1]:8787`、`A.COM.:8787`（尾点 + 大小写）。
+尾点这条有坑——`a.com.` 是合法 FQDN，不 rstrip 会被当成陌生域名误拒，测试里专门盯了它。
+
+### 21.3 三条"别把自己锁在门外"的保险
+
+1. **回环永远放行**：`ml status`、`vpngate9-guard`、`vg9_server_upgrade.sh` 的验收
+   全都打 `https://127.0.0.1:8787`，这条不放行等于升级脚本自己把服务判死。
+2. **逃生阀**：`touch vpngate_data/allow_ip_host` 立即放开，`rm` 立即收紧。
+   每次请求都 stat 一次（成本可忽略），所以**不需要重启**——这点很关键，
+   否则域名解析一失效，人就只能靠 SSH 进去改代码了。
+3. **判断出异常时放行**：`except: denied = False`。`cert_dns_names` 里
+   `ssl._ssl._test_decode_cert` 是 CPython 内部 API，虽然稳定但不能赌它永远不抛。
+
+拒绝页不是干巴巴的 403：写明"该用哪个域名" + 逃生阀命令怎么敲，
+并且日志按 60 秒节流（`_ui_hosts_denied_at`），扫描器刷的时候不会把 journal 打爆。
+
+### 21.4 什么时候不限制
+
+- 没开 HTTPS（`info=None`）
+- 证书是自签的（自签场景本来就应该用 IP 访问）
+- 证书文件读不出域名
+- `allow_ip_host` 存在
+
+以上任一情况都返回空集 = 不限制，行为和升级前完全一致。
+**只有"公共 CA 的域名证书"这一种部署才会收敛**，所以其它机器升级不会被突然锁掉。
+
+### 21.5 验证
+
+新增 `tests/vg9_host_guard_test.py`（26 项，用 openssl 现签一张 SAN 证书，不联网）：
+
+```
+jp.example.com:8787 / cli.example.com:8787   -> 放行
+133.18.147.35(:8787) / evil.example.org      -> 403
+127.0.0.1 / localhost / ::1 / 空 Host        -> 放行
+touch allow_ip_host  -> 立即放开；rm -> 立即收紧
+自签 / 无 HTTPS / 证书文件不存在              -> 不限制
+do_GET、do_POST 都接了检查，且排在鉴权之前
+```
+
+同时给 `vg9_https_test.py` 补了 F6f~F6h（no-store / Pragma），63 → 66 项。

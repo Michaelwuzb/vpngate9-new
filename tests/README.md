@@ -29,7 +29,7 @@ python tests/vg9_new_speed_http_test.py
 # 6. 端到端：分配接口（含登录态、并发、dry_run）                            44 项
 python tests/vg9_assign_http_test.py
 
-# 7. 面板 HTTPS（证书发现 / 自签 / 端到端 https）+ IP 类型未知值             63 项
+# 7. 面板 HTTPS（证书发现 / 自签 / 端到端 https）+ IP 类型未知值 + 禁缓存   66 项
 python tests/vg9_https_test.py
 
 # 8. 失败节点短期跳过 + 国家无货时放宽到全池 + 通道指数退避（修"某通道无限重连"）  27 项
@@ -43,6 +43,9 @@ python tests/vg9_region_http_test.py
 
 # 11. 指定 IP 类型后严格过滤：住宅模式下机房 IP 不参与降级/不顶替           51 项
 python tests/vg9_type_strict_test.py
+
+# 12. 面板只接受域名访问：IP 直连 403 / 回环放行 / allow_ip_host 逃生阀     26 项
+python tests/vg9_host_guard_test.py
 ```
 
 依赖只有 Python 3 标准库和 Node.js（第 3、4 项需要）。Linux 上把 `python` 换成 `python3`。

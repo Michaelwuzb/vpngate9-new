@@ -11,6 +11,7 @@ Combines: multi-tunnel + full node table (IP info, filters, assign to channels)
 from __future__ import annotations
 import base64, csv, io, json, os, random, re, shlex, signal, socket, subprocess, sys
 import threading, time, urllib.request, urllib.parse
+import ipaddress      # Host 头里区分"纯 IP 直连"和"域名访问"
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3320,6 +3321,83 @@ async function logout(){
 </html>"""
 
 # === Web Server ===
+# ---- 面板只接受域名访问：用 IP:端口 直连一律 403 ----
+# 面板用的是公共 CA 签给域名的证书，用 IP 打开本来就只能看到"名字不匹配"的警告页，
+# 没有使用价值，却把 IP:8787 暴露成全网段可扫描的入口。这里按 Host 头收敛：
+#   放行 —— 证书里列出的域名；以及回环（ml status / 守护 / 升级脚本验收都打 127.0.0.1）
+#   拒绝 —— 任何纯 IP 形式的 Host，以及不在证书里的域名
+# 逃生阀（不用重启）：touch vpngate_data/allow_ip_host 立即恢复 IP 访问；
+# 也可以 rm 掉它重新收紧。判断本身出异常时一律放行，绝不把面板锁死。
+ALLOW_IP_FILE = "allow_ip_host"
+_UI_TLS_INFO: dict | None = None          # main() 里 ui_tls.setup() 之后填进来
+_ui_hosts_cache: dict = {"at": 0.0, "hosts": frozenset()}
+_ui_hosts_denied_at: list[float] = [0.0]
+
+
+def cert_dns_names(cert_path: str) -> frozenset:
+    """读证书里所有 DNS 型 SAN（域名）。读不出来就返回空集。"""
+    try:
+        import ssl as _ssl
+        d = _ssl._ssl._test_decode_cert(cert_path)      # CPython 内部 API，只读 PEM，不发请求
+        return frozenset(v.strip().lower().rstrip(".")
+                         for k, v in d.get("subjectAltName", ())
+                         if k.upper() == "DNS" and v)
+    except Exception:
+        return frozenset()
+
+
+def ui_allowed_hosts() -> frozenset:
+    """面板允许的 Host 白名单。空集 = 不限制（HTTP / 自签证书 / 逃生阀打开时）。
+
+    只对"公共 CA 签发的域名证书"生效：这种部署本来就必须用域名访问，
+    自动按证书 SAN 收敛不会误伤；自签证书场景（IP、localhost）保持原样。
+    """
+    if os.path.exists(str(DATA_DIR / ALLOW_IP_FILE)):
+        return frozenset()
+    now = time.time()
+    if now - _ui_hosts_cache["at"] < 30 and _ui_hosts_cache["hosts"]:
+        return _ui_hosts_cache["hosts"]
+    info = _UI_TLS_INFO or {}
+    hosts = frozenset()
+    if info.get("cert") and not info.get("self_signed"):
+        hosts = cert_dns_names(str(info["cert"]))
+    _ui_hosts_cache.update(at=now, hosts=hosts)
+    return hosts
+
+
+def host_of(header: str) -> str:
+    """从 Host 头取出裸主机名：`a.com:8787` -> `a.com`，`[::1]:8787` -> `::1`。
+    末尾的点是合法的 FQDN 写法（`a.com.`），一并归一，否则会被误判成陌生域名。"""
+    h = (header or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        return h[1:].split("]")[0]
+    if ":" in h:
+        h = h.rsplit(":", 1)[0]
+    return h.rstrip(".")
+
+
+def is_loopback_host(h: str) -> bool:
+    return h in ("127.0.0.1", "::1", "localhost", "localhost.localdomain")
+
+
+def host_denied(host_header: str) -> bool:
+    """True = 这个 Host 不该访问面板。"""
+    allowed = ui_allowed_hosts()
+    if not allowed:                       # 没有域名证书可用 -> 不限制
+        return False
+    h = host_of(host_header)
+    if not h or is_loopback_host(h):      # 空 Host（脚本/HTTP/1.0）与回环一律放行
+        return False
+    try:
+        ipaddress.ip_address(h)           # 纯 IP 直连：白名单里只有域名，直接拒
+        return True
+    except ValueError:
+        pass
+    return h not in allowed
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, data: Any, status: int = HTTPStatus.OK):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -3331,6 +3409,44 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def log_message(self, fmt, *args): pass
+
+    def reject_host(self) -> bool:
+        """Host 不在白名单时回 403。返回 True 表示已经处理完，调用方直接 return。"""
+        try:
+            denied = host_denied(self.headers.get("Host", ""))
+        except Exception:
+            denied = False                # 判断出错时放行，绝不把面板锁死
+        if not denied:
+            return False
+        now = time.time()
+        if now - _ui_hosts_denied_at[0] >= 60:      # 节流，别让扫描器刷爆 journal
+            _ui_hosts_denied_at[0] = now
+            log(f"[UI] 拒绝用 IP/未知域名访问面板（Host: {self.headers.get('Host','')}）"
+                f"——请改用 {', '.join(sorted(ui_allowed_hosts()))}:{UI_PORT}；"
+                f"确需 IP 访问就 touch {DATA_DIR / ALLOW_IP_FILE}")
+        dom = sorted(ui_allowed_hosts())
+        url = f"https://{dom[0]}:{UI_PORT}/" if dom else f"https://<域名>:{UI_PORT}/"
+        body = (
+            "<!doctype html><meta charset=utf-8><title>请用域名访问</title>"
+            "<style>body{background:#141419;color:#e0e0e0;font:14px/1.7 system-ui;"
+            "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+            "div{max-width:560px;padding:28px 32px;background:#1a1a24;border-radius:14px;"
+            "border:1px solid rgba(255,255,255,.08)}code{background:#0f0f13;padding:2px 6px;"
+            "border-radius:6px;color:#a5b4fc}a{color:#818cf8}</style>"
+            "<div><h2 style='margin:0 0 10px'>面板不接受 IP 直连</h2>"
+            f"<p>这个面板使用域名证书，请改用：</p><p><a href='{url}'>{url}</a></p>"
+            "<p style='color:#6b7280;font-size:12px;margin-top:18px'>"
+            "用 IP 打开只会看到证书名字不匹配的警告，所以这里直接拒绝了。<br>"
+            f"管理员确实需要用 IP 访问时：在服务器上执行 "
+            f"<code>touch {DATA_DIR / ALLOW_IP_FILE}</code>（立即生效，无需重启）。</p></div>"
+        ).encode()
+        self.send_response(HTTPStatus.FORBIDDEN)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
 
     def read_params(self) -> dict:
         """读取请求体，兼容 form-urlencoded 与 JSON。"""
@@ -3351,6 +3467,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
+
+        if self.reject_host():
+            return
 
         if not check_auth_token(self.headers):
             # API 路径统一返回 401 JSON，别把 HTML 登录页丢给调用方(会破坏 JSON 解析)
@@ -3544,6 +3663,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
+
+        if self.reject_host():
+            return
 
         # 除登录/登出接口外，所有写操作必须已登录。
         # 原来 do_POST 完全没有鉴权，任何人从公网都能调 connect/disconnect/toggle，
@@ -4072,10 +4194,17 @@ def main():
                 time.sleep(2)
     # 面板加密：优先复用机器上已有的证书（s-ui / acme.sh / Let's Encrypt…），
     # 没有才自签。找不到可用的就继续明文 HTTP —— 证书问题绝不能让面板起不来。
-    global _ui_tls_info
+    global _ui_tls_info, _UI_TLS_INFO
     _ui_tls_info = ui_tls.setup(DATA_DIR)
+    _UI_TLS_INFO = _ui_tls_info
     if _ui_tls_info:
         log(f"[UI] https://{UI_HOST}:{UI_PORT}/  {ui_tls.cert_summary(_ui_tls_info)}")
+        _allow = ui_allowed_hosts()
+        if _allow:
+            log(f"[UI] 只接受域名访问：{', '.join(sorted(_allow))}:{UI_PORT}"
+                f"（用 IP 直连会返回 403；临时放开请 touch {DATA_DIR / ALLOW_IP_FILE}）")
+        else:
+            log(f"[UI] 未限制访问域名（自签证书，或已打开 {ALLOW_IP_FILE}）")
     else:
         log(f"[UI] http://{UI_HOST}:{UI_PORT}/  （明文，未启用 HTTPS）")
     _ui_ssl_ctx = _ui_tls_info["context"] if _ui_tls_info else None
