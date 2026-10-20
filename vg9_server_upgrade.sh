@@ -431,7 +431,11 @@ print("    真实出口与面板标注一致: %d 条 / 异常 %d 条" % (agree, 
     fmt "systemd 服务:"  "$(systemctl is-active "$SERVICE")  ($(systemctl is-enabled "$SERVICE" 2>/dev/null))"
     fmt "旧策略表 100~108:" "$(count_rules '10[0-8]') 条 rule（应为 0）"
     fmt "策略表 200~208:"   "$(count_rules '20[0-8]') 条 rule（应为 9）"
-    fmt "代理端口 ${PROXY_FROM}~${PROXY_TO}:" "$(ss -tln | grep -cE ":479[23][0-9]") 个（应为 9）"
+    # 只数正式通道那几档，别把测速专用口（PROXY_TO+1）也算进来 ——
+    # 旧写法 :479[23][0-9] 覆盖到 47939，测速口一监听就会显示 "10 个（应为 9）"，
+    # 让人误以为升级出了异常。
+    fmt "代理端口 ${PROXY_FROM}~${PROXY_TO}:" \
+        "$(ss -tln | grep -cE ":($(seq -s'|' "$PROXY_FROM" "$PROXY_TO"))\b" || true) 个（应为 9）"
     fmt "openvpn 进程:"     "$(pgrep -c openvpn 2>/dev/null || echo 0)"
     fmt "面板监听:"         "$(ss -tln | grep -E ":$PANEL_PORT " | awk '{print $4}' | tr '\n' ' ')"
     local gstate
