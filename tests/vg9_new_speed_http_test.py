@@ -362,7 +362,7 @@ check("没有任务时停止会给出明确提示", st == 409 and d.get("ok") is
 # ------------------------------------------------------------ 页面元素
 head("[9] 页面与脚本")
 st, html = call("GET", "/", use_cookie=False)
-check("页面能打开", st == 200 and "MichaelVPN" in html, f"status={st}")
+check("页面能打开", st == 200 and "MichaelVPN9" in html, f"status={st}")
 for kw, desc in [("测延迟", "延迟测试按钮"), ("测带宽", "带宽测速按钮"),
                  ("清除新标记", "清除新标记按钮"), ("通道测速", "通道测速按钮"),
                  ("只看新节点", "只看新节点筛选"), ("实测带宽", "实测带宽列")]:

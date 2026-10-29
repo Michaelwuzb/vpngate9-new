@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# MichaelVPN / vpngate9 —— 服务端「原地升级」脚本
+# MichaelVPN9 —— 服务端「原地升级」脚本
 #
 # 干什么：
 #   把 /opt/michaelvpn 上的旧版本原地升级到 GitHub 仓库最新版，并且顺手处理
@@ -208,7 +208,7 @@ plan() {
 
     if [ "$ART_LOGIN" = "$(cat "$INSTALL_DIR/vpngate_data/login.html" 2>/dev/null)" ]; then
         ok "登录页已是最新"
-    elif grep -q "<title>MichaelVPN" "$INSTALL_DIR/vpngate_data/login.html" 2>/dev/null; then
+    elif grep -qE "<title>(MichaelVPN|AimiliVPN|aimilivpn|michaelvpn)" "$INSTALL_DIR/vpngate_data/login.html" 2>/dev/null; then
         LOGIN_CHANGED=1; ok "登录页需要更新（是旧版自带模板）"
     else
         warn "登录页看起来被自定义过，不覆盖（需要自己合并 install.sh 的 LOGINEOF 段）"
@@ -490,7 +490,7 @@ do_rollback() {
 ensure_root "$@"     # 非 root + 免密 sudo → 在打印横幅前就提权重跑，避免横幅重复
 echo
 echo "==================================================================="
-echo "  MichaelVPN / vpngate9 服务端升级   $(date '+%F %T')   模式: $MODE"
+echo "  MichaelVPN9 服务端升级   $(date '+%F %T')   模式: $MODE"
 echo "==================================================================="
 echo
 

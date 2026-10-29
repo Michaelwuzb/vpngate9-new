@@ -528,7 +528,7 @@ except Exception as e:
     page = ""
     login_err = str(e)
 check("H2 在 https 下登录面板并拿到面板页（整条链路可用）",
-      "MichaelVPN" in page, (login_err or page[:120])[:200])
+      "MichaelVPN9" in page, (login_err or page[:120])[:200])
 
 st_json = {}
 err = ""

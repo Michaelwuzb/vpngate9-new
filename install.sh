@@ -34,7 +34,7 @@ cleanup_policy_routing() {
 
 # === 卸载功能 ===
 if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "卸载" ]; then
-    echo -e "${YELLOW}正在卸载 MichaelVPN...${NC}"
+    echo -e "${YELLOW}正在卸载 MichaelVPN9...${NC}"
     systemctl stop ${SERVICE_NAME} 2>/dev/null || true
     systemctl disable ${SERVICE_NAME} 2>/dev/null || true
     # 守护也装了服务，得一起停掉 —— 否则它会继续按老端口探活、给已删掉的通道重连
@@ -97,7 +97,7 @@ deploy_code() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MichaelVPN 登录</title>
+<title>MichaelVPN9 登录</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f13;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh}
@@ -115,7 +115,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </head>
 <body>
 <div class="card">
-<div class="logo">MichaelVPN</div>
+<div class="logo">MichaelVPN9</div>
 <div class="sub">9通道 VPN 管理面板</div>
 <form method="post" action="/api/login">
 <div class="fg"><label>管理账号</label><input type="text" name="username" required autocomplete="username"></div>
@@ -163,7 +163,7 @@ install_service() {
     echo -e "${CYAN}[3/5] 配置面板服务...${NC}"
     cat > /lib/systemd/system/${SERVICE_NAME}.service << 'SERVICEEOF'
 [Unit]
-Description=MichaelVPN 9-Channel VPN Gateway
+Description=MichaelVPN9 VPN Gateway
 After=network.target network-online.target
 Wants=network-online.target
 # 崩溃后允许无限重启（默认 5 次/10 秒 就会被 systemd 放弃）
@@ -197,7 +197,7 @@ install_guard_service() {
     echo -e "${CYAN}[4/5] 配置守护服务...${NC}"
     cat > /lib/systemd/system/${GUARD_SERVICE}.service << 'GUARDEOF'
 [Unit]
-Description=MichaelVPN Channel Guard (fake-connection detector)
+Description=MichaelVPN9 Guard (fake-connection detector)
 # 面板是它探活的对象，排在面板后面启动才有意义
 After=network.target network-online.target michaelvpn.service
 Wants=network-online.target
@@ -240,7 +240,7 @@ case "${1:-status}" in
     stop)    systemctl stop michaelvpn vpngate9-guard 2>/dev/null ;;
     restart) systemctl restart michaelvpn 2>/dev/null; systemctl restart vpngate9-guard 2>/dev/null ;;
     uninstall|卸载)
-        echo -e "\033[0;33m正在卸载 MichaelVPN...\033[0m"
+        echo -e "\033[0;33m正在卸载 MichaelVPN9...\033[0m"
         systemctl stop michaelvpn 2>/dev/null || true
         systemctl disable michaelvpn 2>/dev/null || true
         systemctl stop vpngate9-guard 2>/dev/null || true
@@ -259,7 +259,7 @@ case "${1:-status}" in
         pkill -f "vpngate9_multi\|proxy_server_multi\|vpngate9_guard" 2>/dev/null || true
         echo -e "\033[0;32m卸载完成！\033[0m" ;;
     status)
-        echo "=== MichaelVPN 9-Channel ==="
+        echo "=== MichaelVPN9 ==="
         panel_api /api/status | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -328,7 +328,7 @@ if [ "${1:-}" = "--guard-only" ] || [ "${1:-}" = "guard-only" ]; then
 fi
 
 echo -e "${CYAN}============================"
-echo "  MichaelVPN 9-Channel 部署"
+echo "  MichaelVPN9 部署"
 echo "============================${NC}"
 detect_distro
 install_deps

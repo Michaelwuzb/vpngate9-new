@@ -33,7 +33,7 @@ DEFAULT_SPEEDTEST_BYTES = int(os.environ.get("SPEEDTEST_BYTES", "10000000"))  # 
 DEFAULT_TIMEOUT = float(os.environ.get("SPEEDTEST_TIMEOUT", "30"))            # 单次测速上限(秒)
 WARMUP_SECONDS = float(os.environ.get("SPEEDTEST_WARMUP", "0.6"))             # 丢掉慢启动阶段
 
-_UA = "Mozilla/5.0 (X11; Linux x86_64) MichaelVPN-SpeedTest/1.0"
+_UA = "Mozilla/5.0 (X11; Linux x86_64) MichaelVPN9-SpeedTest/1.0"
 
 
 class SocksError(Exception):

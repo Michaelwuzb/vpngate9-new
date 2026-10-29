@@ -1,6 +1,6 @@
-# MichaelVPN 9-Channel
+# MichaelVPN9
 
-> 基于 VPNGate 的 9 通道独立出口 VPN 网关
+> 基于 VPNGate 的 9 通道独立出口 VPN 网关（MichaelVPN9）
 > 每个通道拥有独立的 OpenVPN 隧道、虚拟网卡(tun)、代理端口和出站 IP
 
 ---
