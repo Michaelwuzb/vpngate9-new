@@ -4101,6 +4101,27 @@ class Handler(BaseHTTPRequestHandler):
                 ch.enabled = True
                 save_channels()
             else:
+                # sticky=1：守护重连专用。完全沿用通道现有设定 —— 不覆盖用户选的县、
+                # 不清降级锁。用户没选过县时用上一个节点的县做提示，
+                # 做到「同一城市还有可用 IP 就留原地，没了才就近换」。
+                sticky = (params.get("sticky", [""])[0] or "").lower() in ("1", "true", "yes")
+                if sticky:
+                    if not ch.force_country:
+                        self.send_json({"ok": False,
+                                        "error": "sticky 重连要求该通道已设定固定出口"},
+                                       HTTPStatus.BAD_REQUEST); return
+                    region_hint = ch.force_region
+                    if not region_hint and ch.last_node_data:
+                        region_hint = (ch.last_node_data.get("region_key")
+                                       or ch.last_node_data.get("region") or "").strip()
+                    node = get_best_node_for_country(ch.force_country, ch.force_ip_type,
+                                                     exclude_ch=ch, region=region_hint)
+                    if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
+                    ch.enabled = True
+                    save_channels()
+                    ok = connect_channel(ch, node)
+                    self.send_json({"ok":ok,"channel":ch.to_dict()})
+                    return
                 node = get_best_node_for_country(country, ip_type, exclude_ch=ch,
                                                  region=region, locked="")
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
@@ -4230,8 +4251,17 @@ def channel_watchdog():
                             ch.reserved_ip = last.get("ip","")
                             log(f"[WD CH{ch.index}] Retry same node {last.get('ip','')}")
                     if node is None:
+                        # 「IP 不能用了才换，同城优先」：
+                        #   用户选过县 -> 同县 -> 固定顺序/由近到远递补（原有行为）；
+                        #   用户只选了国家 -> 用**上一个节点的县**做提示：该市还有
+                        #   可用 IP 就留在原地，真没了才就近换，而不是全国乱跳。
+                        #   以此类推：落在埼玉后，下次优先还是埼玉。
+                        region_hint = force_region
+                        if not region_hint and last:
+                            region_hint = (last.get("region_key")
+                                           or last.get("region") or "").strip()
                         node = get_best_node_for_country(force_country, ch.force_ip_type,
-                                                         exclude_ch=ch, region=force_region)
+                                                         exclude_ch=ch, region=region_hint)
                     if node:
                         # 已锁定县时把锁定点也打出来：一眼能看出"不会再切回目标县"
                         where = force_region

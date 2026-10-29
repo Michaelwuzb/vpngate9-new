@@ -218,8 +218,15 @@ def test_socks(port: int):
 
 
 def reconnect(idx: int, country: str, ip_type: str, node_id=None):
-    """按通道自己的国家/IP类型重连; 不传国家时由服务端在节点池里随机挑。"""
+    """按通道自己的设定重连。
+
+    country 非空时带 sticky=1：面板沿用该通道的县选择与降级锁（不清掉），
+    且用户没选过县时以上一个节点的县做提示 —— 同城还有可用 IP 就留原地，
+    没了才按固定顺序/由近到远就近换。
+    """
     q = {"country": country or "", "ip_type": ip_type or ""}
+    if country:
+        q["sticky"] = "1"
     if node_id:
         q["node_id"] = node_id
     return api("/api/channel/%d/connect?%s" % (idx, urllib.parse.urlencode(q)), method="POST")
